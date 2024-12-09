@@ -1,0 +1,25 @@
+[project]
+authors = ["Nicolas Camenisch <garnele007@gmail.com>"]
+channels = ["conda-forge"]
+description = "Add a short description here"
+name = "resprop"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = ">=3.9,<3.11.0a0"
+pytorch = ">=2.5.1,<3"
+transformers = ">=4.46.0"
+datasets = ">=3.1.0,<4"
+accelerate = ">0.26.0"
+scikit-learn = ">=1.5.2,<2"
+matplotlib = ">=3.9.2,<4"
+
+[pypi-dependencies]
+evaluate = ">=0.4.3"
+
+[build-dependencies]
+jupyter = ">=1.1.1,<2"
+pixi-pycharm = ">=0.0.8,<0.0.9"
