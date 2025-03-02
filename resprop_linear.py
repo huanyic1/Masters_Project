@@ -107,6 +107,29 @@ class ReSpropLinear(nn.Linear):
         return super().extra_repr() + f", reuse_percentage={self.reuse_percentage}"
 
 
+
+def resprop_linear(layer: nn.Linear):
+    return ReSpropLinear(
+        layer.in_features,
+        layer.out_features,
+        layer.bias is not None,
+        reuse_percentage=reuse_percentage
+    )
+
+def resprofify_gpt2(base_model, reuse_percentage=0.9):
+    model = copy.deepcopy(base_model)
+    for block in model.transformer.h:  # Iterate through transformer layers
+        # Self Attention
+        attn = block.attn
+        attn.c_attn = resprop_linear(attn.c_attn)  # Projects query, key, and value
+        attn.c_proj = resprop_linear(attn.c_proj)  # Attention output projection
+
+        # Feed Forward Block
+        block.mlp.c_fc = resprop_linear(block.mlp.c_fc)  # First Linear Layer in MLP
+        block.mlp.c_proj = resprop_linear(block.mlp.c_proj)  # Second Linear Layer in MLP
+
+    return model
+
 def resprofify_bert(base_model, reuse_percentage=0.9):
     def resprop_linear(layer: nn.Linear):
         return ReSpropLinear(
@@ -115,7 +138,6 @@ def resprofify_bert(base_model, reuse_percentage=0.9):
             layer.bias is not None,
             reuse_percentage=reuse_percentage
         )
-
     model = copy.deepcopy(base_model)
     for layer in model.bert.encoder.layer:
         # Self Attention
