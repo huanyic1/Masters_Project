@@ -17,8 +17,8 @@ def plot_log_histories(log_histories, file_name=None):
         acc_x = [x["epoch"] for x in log_history if "eval_accuracy" in x]
         acc_y = [x["eval_accuracy"] for x in log_history if "eval_accuracy" in x]
 
-        ax[0].plot(loss_x, loss_y, label=label)
-        ax[1].plot(acc_x, acc_y, label=label)
+        ax[0].plot(loss_x, loss_y, label=label, alpha=0.7)
+        ax[1].plot(acc_x, acc_y, label=label, alpha=0.7)
 
     ax[0].set_xlabel("Epoch")
     ax[0].set_ylabel("Training Loss")

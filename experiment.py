@@ -8,7 +8,9 @@ from transformers import TrainingArguments, Trainer
 
 from resprop_linear import resprofify_bert
 from plot import plot_log_histories
-
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import os
 
 import torch
 
@@ -17,21 +19,22 @@ print("Number of GPUs:", torch.cuda.device_count())
 print("GPU Name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "No GPU found")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# world_size = torch.cuda.device_count()
+# os.environ["MASTER_ADDR"] = "localhost"
+# os.environ["MASTER_PORT"] = "12355"
+
+# # Initialize the process group
+# dist.init_process_group(
+#     backend="nccl",
+#     init_method="env://",
+#     rank=0,  # Since it's a single node, use rank=0
+#     world_size=world_size
+# )
 
 
+model_name = "prajjwal1/bert-tiny"
+# model_name = "bert-base-uncased"
 
-
-# Remember to change to train and test later
-
-
-# # Set format for PyTorch
-# tokenized_datasets = tokenized_datasets.remove_columns(["sentence", "idx"]).with_format("torch")
-
-
-
-# model_name = "prajjwal1/bert-tiny"
-model_name = "bert-base-uncased"
-# tokenizer = AutoTokenizer.from_pretrained(model_name)
 base_model = BertForSequenceClassification.from_pretrained(
     model_name,
     num_labels=2,
@@ -43,27 +46,18 @@ base_model = BertForSequenceClassification.from_pretrained(
 def tokenize_function(examples):
     return tokenizer(examples["text"], max_length=128, padding="max_length", truncation=True)
 
-# model_name = "bert-base-uncased"
-# base_model = BertForSequenceClassification.from_pretrained(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-# # Load Data
-# # remember to save tokenized data next time
-# def tokenize_function(examples):
-#     return tokenizer(examples["sentence"], padding="max_length", truncation=True)
 
 print('loaded model', model_name)
 print('model config', base_model.config)
 
-# Load Data
-# 
 
 dataset = load_dataset("fancyzhx/yelp_polarity")
-# dataset = load_dataset("glue", "sst2")
 tokenized_datasets = dataset.map(tokenize_function, batched=True)
 
-train_dataset = tokenized_datasets["train"].shuffle(seed=42).select(range(640))
-eval_dataset = tokenized_datasets["test"].shuffle(seed=42).select(range(100))
+train_dataset = tokenized_datasets["train"].shuffle(seed=42).select(range(1000))
+eval_dataset = tokenized_datasets["test"].shuffle(seed=42).select(range(500))
 
 # Accuracy
 metric = evaluate.load("accuracy")
@@ -75,19 +69,23 @@ def compute_metrics(eval_pred):
 
 
 log_histories = {}
-for reuse_percentage in  [0.0, 0.5, 0.7, 0.9, 0.95, 0.99]: # [0.0, 0.5, 0.7, 0.9, 0.95, 0.99]
+for reuse_percentage in  [0.0,0.9,0.99]: # [0.0, 0.5, 0.7, 0.9, 0.95, 0.99]
+    print(f"Reuse Percentage: {reuse_percentage}")
     model = resprofify_bert(base_model, reuse_percentage=reuse_percentage)
+    # model = torch.nn.DataParallel(model)
     model.to(device)
+    # model = DDP(model, device_ids=[torch.cuda.current_device()], output_device=torch.cuda.current_device())
     training_args = TrainingArguments(
         output_dir=f"trainer_out/{model_name.replace('/', '-')}/rp_{int(reuse_percentage * 100)}",
         eval_strategy="steps",
         num_train_epochs=4,
         eval_steps=1/64, 
         logging_steps=1/32,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
+        # per_device_train_batch_size=128,
+        # per_device_eval_batch_size=128,        
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
         logging_dir=f"trainer_out/{model_name.replace('/', '-')}/rp_{int(reuse_percentage * 100)}",
-        fp16=True
     )
 
     trainer = Trainer(
@@ -105,3 +103,5 @@ for reuse_percentage in  [0.0, 0.5, 0.7, 0.9, 0.95, 0.99]: # [0.0, 0.5, 0.7, 0.9
 
 # Generate Plot
 plot_log_histories(log_histories, file_name="result.png")
+
+#       

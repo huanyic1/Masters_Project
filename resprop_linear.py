@@ -6,6 +6,10 @@ import copy
 class ReSpropLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, prev_grad_output, reuse_percentage):
+        device = input.device  # Get the device
+        weight, bias = weight.to(device), bias.to(device) if bias is not None else None
+        prev_grad_output = prev_grad_output.to(device) if prev_grad_output is not None else None
+
         if prev_grad_output is not None and \
                 len(input.shape) == 3 and prev_grad_output.size(0) == input.size(1):
             prev_grad_input = torch.mm(prev_grad_output, weight)                        # pre∇w_l
@@ -89,12 +93,14 @@ class ReSpropLinear(nn.Linear):
         self.reuse_percentage = reuse_percentage
 
     def forward(self, input):
-        output = ReSpropLinearFunction.apply(input, self.weight, self.bias, self.prev_gradients, self.reuse_percentage)
-
+        device = input.device  # Ensure all tensors stay on the same GPU
+        output = ReSpropLinearFunction.apply(input, self.weight.to(device), self.bias.to(device) if self.bias is not None else None, 
+                                         self.prev_gradients.to(device) if self.prev_gradients is not None else None, 
+                                         self.reuse_percentage)
         if output.requires_grad:
             def hook(grad_output):
-                # Store gradients for next iteration
-                self.prev_gradients = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
+                # Store gradients on the correct GPU
+                self.prev_gradients = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach().to(device)
                 return None
 
             output.register_hook(hook)
@@ -107,7 +113,6 @@ class ReSpropLinear(nn.Linear):
         return super().extra_repr() + f", reuse_percentage={self.reuse_percentage}"
 
 
-
 def resprop_linear(layer: nn.Linear):
     return ReSpropLinear(
         layer.in_features,
@@ -116,19 +121,19 @@ def resprop_linear(layer: nn.Linear):
         reuse_percentage=reuse_percentage
     )
 
-def resprofify_gpt2(base_model, reuse_percentage=0.9):
-    model = copy.deepcopy(base_model)
-    for block in model.transformer.h:  # Iterate through transformer layers
-        # Self Attention
-        attn = block.attn
-        attn.c_attn = resprop_linear(attn.c_attn)  # Projects query, key, and value
-        attn.c_proj = resprop_linear(attn.c_proj)  # Attention output projection
+# def resprofify_gpt2(base_model, reuse_percentage=0.9):
+#     model = copy.deepcopy(base_model)
+#     for block in model.transformer.h:  # Iterate through transformer layers
+#         # Self Attention
+#         attn = block.attn
+#         attn.c_attn = resprop_linear(attn.c_attn)  # Projects query, key, and value
+#         attn.c_proj = resprop_linear(attn.c_proj)  # Attention output projection
 
-        # Feed Forward Block
-        block.mlp.c_fc = resprop_linear(block.mlp.c_fc)  # First Linear Layer in MLP
-        block.mlp.c_proj = resprop_linear(block.mlp.c_proj)  # Second Linear Layer in MLP
+#         # Feed Forward Block
+#         block.mlp.c_fc = resprop_linear(block.mlp.c_fc)  # First Linear Layer in MLP
+#         block.mlp.c_proj = resprop_linear(block.mlp.c_proj)  # Second Linear Layer in MLP
 
-    return model
+#     return model
 
 def resprofify_bert(base_model, reuse_percentage=0.9):
     def resprop_linear(layer: nn.Linear):
