@@ -97,8 +97,8 @@ class ReSpropLinear(nn.Linear):
         if output.requires_grad:
             def hook(grad_output):
                 self.step_counter[device] += 1
-                prev_grad_output = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
                 if self.step_counter[device] % self.k == 0:
+                    prev_grad_output = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
                     prev_grad_input = torch.mm(prev_grad_output, self.weight.to(device))
                     prev_grad_weight = torch.mm(prev_grad_output.t(), torch.sum(input, dim=0))
                     sampled = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
@@ -115,61 +115,34 @@ class ReSpropLinear(nn.Linear):
         return super().extra_repr() + f", reuse_percentage={self.reuse_percentage}"
 class ReSpropAttentionFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, prev_grad_output, reuse_percentage):
+    def forward(ctx, Q, K, V, prev_grad_Q, prev_grad_K, prev_grad_V, reuse_percentage):
         ctx.reuse_percentage = reuse_percentage
-
+        ctx.save_for_backward(Q, K, V, prev_grad_Q, prev_grad_K, prev_grad_V)
         d_k = Q.size(-1)
+
         attn_scores = torch.bmm(Q, K.transpose(1, 2)) / (d_k ** 0.5)
         attn_probs = torch.softmax(attn_scores, dim=-1)
-        output = torch.bmm(attn_probs, V)
+        ctx.attn_probs = attn_probs
 
-        prev_grad_Q = prev_grad_K = prev_grad_V = None
-
-        # If prev_grad_output exists, precompute previous grad_Q, grad_K, grad_V now
-        if prev_grad_output is not None:
-            with torch.no_grad():
-                grad_dict = prev_grad_output
-                prev_grad_output = grad_dict["grad_output"]
-                idx = grad_dict["index"]
-
-                V_slice = V[idx:idx+1]
-                Q_slice = Q[idx:idx+1]
-                K_slice = K[idx:idx+1]
-
-                prev_grad_attn_probs = torch.bmm(prev_grad_output, V_slice.transpose(1, 2))
-                prev_grad_V = torch.bmm(attn_probs[idx:idx+1].transpose(1, 2), prev_grad_output)
-
-                prev_grad_attn_scores = prev_grad_attn_probs * attn_probs[idx:idx+1]
-                prev_grad_attn_scores_sum = prev_grad_attn_scores.sum(dim=-1, keepdim=True)
-                prev_grad_attn_scores = prev_grad_attn_scores - attn_probs[idx:idx+1] * prev_grad_attn_scores_sum
-                prev_grad_attn_scores /= (d_k ** 0.5)
-
-                prev_grad_Q = torch.bmm(prev_grad_attn_scores, K_slice)
-                prev_grad_K = torch.bmm(prev_grad_attn_scores.transpose(1, 2), Q_slice)
-
-        # Save everything needed
-        ctx.save_for_backward(Q, K, V, prev_grad_Q, prev_grad_K, prev_grad_V, attn_probs)
-
-        return output
+        return torch.bmm(attn_probs, V)
 
     @staticmethod
     def backward(ctx, grad_output):
-        Q, K, V, prev_grad_Q, prev_grad_K, prev_grad_V, attn_probs = ctx.saved_tensors
+        Q, K, V, prev_grad_Q, prev_grad_K, prev_grad_V = ctx.saved_tensors
+        attn_probs = ctx.attn_probs
         d_k = Q.size(-1)
 
-        # Standard gradient computations
         grad_attn_probs = torch.bmm(grad_output, V.transpose(1, 2))
         grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_output)
 
         grad_attn_scores = grad_attn_probs * attn_probs
-        grad_attn_scores_sum = grad_attn_scores.sum(dim=-1, keepdim=True)
-        grad_attn_scores = grad_attn_scores - attn_probs * grad_attn_scores_sum
+        grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
         grad_attn_scores /= (d_k ** 0.5)
 
         grad_Q = torch.bmm(grad_attn_scores, K)
         grad_K = torch.bmm(grad_attn_scores.transpose(1, 2), Q)
 
-        # Apply ReSprop logic if previous grads exist
+        # Apply reuse
         def sparsify(current, previous):
             grad_diff = current - previous
             if ctx.reuse_percentage > 0:
@@ -186,8 +159,8 @@ class ReSpropAttentionFunction(torch.autograd.Function):
         if prev_grad_V is not None:
             grad_V = sparsify(grad_V, prev_grad_V)
 
-        return grad_Q, grad_K, grad_V, None, None
-
+        return grad_Q, grad_K, grad_V, None, None, None, None
+   
 
 def resprop_linear(layer: nn.Linear, reuse_percentage=0.9, k=1):
     return ReSpropLinear(layer.in_features, layer.out_features, layer.bias is not None, reuse_percentage=reuse_percentage, k=k)
@@ -207,49 +180,86 @@ class ReSpropAttention(nn.Module):
             self.k_proj = nn.Linear(embed_dim, embed_dim)
             self.v_proj = nn.Linear(embed_dim, embed_dim)
 
-        self.prev_gradients = {}
+        self.prev_gradients = {}  # stores grad_output and index
         self.prev_grad_Q = {}
         self.prev_grad_K = {}
         self.prev_grad_V = {}
         self.step_counter = {}
 
     def forward(self, hidden_states):
-            device = hidden_states.device
-            if device not in self.prev_gradients:
-                self.prev_gradients[device] = None  # Just prev grad_output
+        device = hidden_states.device
+        self.step_counter.setdefault(device, 0)
+        self.prev_gradients.setdefault(device, None)
+        self.prev_grad_Q.setdefault(device, None)
+        self.prev_grad_K.setdefault(device, None)
+        self.prev_grad_V.setdefault(device, None)
 
-            Q = self.q_proj(hidden_states)
-            K = self.k_proj(hidden_states)
-            V = self.v_proj(hidden_states)
+        Q = self.q_proj(hidden_states)
+        K = self.k_proj(hidden_states)
+        V = self.v_proj(hidden_states)
 
-            output = ReSpropAttentionFunction.apply(
-                Q, K, V,
-                self.prev_gradients[device],
-                self.reuse_percentage
-            )
+        # Decide whether to recompute
+        step = self.step_counter[device]
+        should_recompute = (step % self.k == 0)
 
-            if output.requires_grad:
-                def hook(grad_output):
-                    rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
-                    sampled_grad = grad_output[rand_idx:rand_idx+1].clone().detach()
-                    self.prev_gradients[device] = {
-                        "grad_output": sampled_grad,
-                        "index": rand_idx,
-                    }
-                    return None
+        if should_recompute and self.prev_gradients[device] is not None:
+            with torch.no_grad():
+                grad_output = self.prev_gradients[device]["grad_output"]
+                idx = self.prev_gradients[device]["index"]
 
-                output.register_hook(hook)
-            else:
-                self.prev_gradients[device] = None
+                V_slice = V[idx:idx+1]
+                Q_slice = Q[idx:idx+1]
+                K_slice = K[idx:idx+1]
 
-            return output
+                d_k = Q.size(-1)
+                attn_scores = torch.bmm(Q_slice, K_slice.transpose(1, 2)) / (d_k ** 0.5)
+                attn_probs = torch.softmax(attn_scores, dim=-1)
+
+                grad_attn_probs = torch.bmm(grad_output, V_slice.transpose(1, 2))
+                grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_output)
+
+                grad_attn_scores = grad_attn_probs * attn_probs
+                grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
+                grad_attn_scores /= (d_k ** 0.5)
+
+                grad_Q = torch.bmm(grad_attn_scores, K_slice)
+                grad_K = torch.bmm(grad_attn_scores.transpose(1, 2), Q_slice)
+
+                self.prev_grad_Q[device] = grad_Q.detach()
+                self.prev_grad_K[device] = grad_K.detach()
+                self.prev_grad_V[device] = grad_V.detach()
+
+        output = ReSpropAttentionFunction.apply(
+            Q, K, V,
+            self.prev_grad_Q[device],
+            self.prev_grad_K[device],
+            self.prev_grad_V[device],
+            self.reuse_percentage
+        )
+
+        if output.requires_grad:
+            def hook(grad_output):
+                self.step_counter[device] += 1
+                rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
+                sampled_grad = grad_output[rand_idx:rand_idx+1].clone().detach()
+                self.prev_gradients[device] = {
+                    "grad_output": sampled_grad,
+                    "index": rand_idx
+                }
+                return None
+
+            output.register_hook(hook)
+        else:
+            self.prev_gradients[device] = None
+
+        return output
 
 
     def extra_repr(self):
         return f"embed_dim={self.embed_dim}, reuse_percentage={self.reuse_percentage}"
 
 
-def respropify_bert_att(base_model, att_reuse_percentage=0.9, lin_reuse_percentage=0.9, lin_k=1, att_k=1):
+def respropify_bert_att_k(base_model, att_reuse_percentage=0.9, lin_reuse_percentage=0.9, lin_k=1, att_k=1):
     model = copy.deepcopy(base_model).to(torch.cuda.current_device())
 
     def resprop_attention_block(embed_dim):
@@ -278,7 +288,7 @@ def respropify_bert_att(base_model, att_reuse_percentage=0.9, lin_reuse_percenta
 
 
 
-def patch_bert_self_attention(model):
+def patch_bert_self_attention_k(model):
     for layer in model.bert.encoder.layer:
         attn_self = layer.attention.self
 
