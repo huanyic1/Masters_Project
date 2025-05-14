@@ -5,6 +5,9 @@ import copy
 import math
 import types
 
+def get_current_reuse_percentage(reuse_schedule, step):
+    applicable = [rp for rp, start in reuse_schedule if step >= start]
+    return applicable[-1] if applicable else 0.0
 
 class ReSpropLinearFunction(torch.autograd.Function):
     @staticmethod
@@ -67,9 +70,9 @@ class ReSpropLinearFunction(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 
 class ReSpropLinear(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None, reuse_percentage=0.9, k=1):
+    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None, reuse_schedule=None, k=1):
         super().__init__(in_features, out_features, bias, device, dtype)
-        self.reuse_percentage = reuse_percentage
+        self.reuse_schedule = reuse_schedule or [(0.9, 0)]
         self.k = k
         self.prev_gradients = {}
         self.prev_grad_input = {}
@@ -83,14 +86,17 @@ class ReSpropLinear(nn.Linear):
         self.prev_grad_weight.setdefault(device, None)
         self.step_counter.setdefault(device, 0)
 
+        step = self.step_counter[device]
+        reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step)
+
         output = ReSpropLinearFunction.apply(
             input, self.weight.to(device),
             self.bias.to(device) if self.bias is not None else None,
             self.prev_gradients[device],
             self.prev_grad_input[device],
             self.prev_grad_weight[device],
-            self.reuse_percentage, 
-            self.step_counter,
+            reuse_percentage, 
+            step,
             self.k
         )
 
@@ -113,6 +119,8 @@ class ReSpropLinear(nn.Linear):
 
     def extra_repr(self):
         return super().extra_repr() + f", reuse_percentage={self.reuse_percentage}"
+
+        
 class ReSpropAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, prev_grad_Q, prev_grad_K, prev_grad_V, reuse_percentage):
@@ -162,19 +170,19 @@ class ReSpropAttentionFunction(torch.autograd.Function):
         return grad_Q, grad_K, grad_V, None, None, None, None
    
 
-def resprop_linear(layer: nn.Linear, reuse_percentage=0.9, k=1):
-    return ReSpropLinear(layer.in_features, layer.out_features, layer.bias is not None, reuse_percentage=reuse_percentage, k=k)
+def resprop_linear(layer: nn.Linear, reuse_schedule=None, k=1):
+    return ReSpropLinear(layer.in_features, layer.out_features, layer.bias is not None, reuse_schedule=reuse_schedule, k=k)
 class ReSpropAttention(nn.Module):
-    def __init__(self, embed_dim, reuse_percentage=0.9, lin_reuse_percentage=None, att_k=1, lin_k=1):
+    def __init__(self, embed_dim, reuse_schedule=None, lin_reuse_schedule=None, att_k=1, lin_k=1):
         super().__init__()
         self.embed_dim = embed_dim
-        self.reuse_percentage = reuse_percentage
+        self.reuse_schedule = reuse_schedule or [(0.9, 0)]
         self.k = att_k
 
-        if lin_reuse_percentage:
-            self.q_proj = resprop_linear(nn.Linear(embed_dim, embed_dim), reuse_percentage=lin_reuse_percentage, k=lin_k)
-            self.k_proj = resprop_linear(nn.Linear(embed_dim, embed_dim), reuse_percentage=lin_reuse_percentage, k=lin_k)
-            self.v_proj = resprop_linear(nn.Linear(embed_dim, embed_dim), reuse_percentage=lin_reuse_percentage, k=lin_k)
+        if lin_reuse_schedule:
+            self.q_proj = resprop_linear(nn.Linear(embed_dim, embed_dim), reuse_schedule=lin_reuse_schedule, k=lin_k)
+            self.k_proj = resprop_linear(nn.Linear(embed_dim, embed_dim), reuse_schedule=lin_reuse_schedule, k=lin_k)
+            self.v_proj = resprop_linear(nn.Linear(embed_dim, embed_dim), reuse_schedule=lin_reuse_schedule, k=lin_k)
         else:
             self.q_proj = nn.Linear(embed_dim, embed_dim)
             self.k_proj = nn.Linear(embed_dim, embed_dim)
@@ -200,6 +208,7 @@ class ReSpropAttention(nn.Module):
 
         # Decide whether to recompute
         step = self.step_counter[device]
+        reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step)
         should_recompute = (step % self.k == 0)
 
         if should_recompute and self.prev_gradients[device] is not None:
@@ -234,7 +243,7 @@ class ReSpropAttention(nn.Module):
             self.prev_grad_Q[device],
             self.prev_grad_K[device],
             self.prev_grad_V[device],
-            self.reuse_percentage
+            reuse_percentage
         )
 
         if output.requires_grad:
@@ -259,14 +268,14 @@ class ReSpropAttention(nn.Module):
         return f"embed_dim={self.embed_dim}, reuse_percentage={self.reuse_percentage}"
 
 
-def respropify_bert_att_k(base_model, att_reuse_percentage=0.9, lin_reuse_percentage=0.9, lin_k=1, att_k=1):
+def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedule=None, lin_k=1, att_k=1):
     model = copy.deepcopy(base_model).to(torch.cuda.current_device())
 
     def resprop_attention_block(embed_dim):
-        return ReSpropAttention(embed_dim, reuse_percentage=att_reuse_percentage, lin_reuse_percentage= lin_reuse_percentage, att_k=att_k, lin_k=lin_k)
+        return ReSpropAttention(embed_dim, reuse_schedule=att_reuse_schedule, lin_reuse_schedule= lin_reuse_schedule, att_k=att_k, lin_k=lin_k)
 
     def resprop_linear(layer: nn.Linear):
-        return ReSpropLinear(layer.in_features, layer.out_features, layer.bias is not None, reuse_percentage=lin_reuse_percentage, k=lin_k)
+        return ReSpropLinear(layer.in_features, layer.out_features, layer.bias is not None, reuse_schedule=lin_reuse_schedule, k=lin_k)
 
     for layer in model.bert.encoder.layer:
         att = layer.attention

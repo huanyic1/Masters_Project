@@ -20,6 +20,10 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
+
+def get_schedule_string(schedule):
+    return ','.join(f'(rp: {x}, start: {y})' for x, y in schedule)
+
 def process_base(rank, world_size, reuse_percentage, model_name, train_dataset, eval_dataset):
     # FOR ABSOLUTELY NO CHANGES
     # setup(rank, world_size)
@@ -217,10 +221,12 @@ def process_warmup(rank, world_size, reuse_schedule, model_name, train_dataset, 
     if rank == 0:
         torch.save(trainer.state.log_history, f"log_history_warmup.pt")
 
-def att_process(rank, world_size, lin_reuse_percentage, att_reuse_percentage, model_name, train_dataset, eval_dataset, seed=42, lin_k=1, att_k=1):
+def att_process(rank, world_size, lin_schedule, att_schedule, model_name, train_dataset, eval_dataset, seed=42, lin_k=1, att_k=1):
     # setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
-    print(f"Process {rank} using device: {device}, Attention Reuse Percentage: {att_reuse_percentage}, Linear Reuse Percentage: {lin_reuse_percentage}")
+    att_str = get_schedule_string(att_schedule)
+    lin_str = get_schedule_string(lin_schedule)
+    print(f"Process {rank} using device: {device}, Attention Schedule: {att_str}, Linear Schedule: {lin_str}, Linear K: {lin_k}, Attention K: {att_k}")
 
     base_model = BertForSequenceClassification.from_pretrained(
         model_name,
@@ -228,21 +234,31 @@ def att_process(rank, world_size, lin_reuse_percentage, att_reuse_percentage, mo
         id2label={0: "Negative", 1: "Positive"}
     )
 
-    # model = resprofify_bert(base_model, reuse_percentage=lin_reuse_percentage)
-    model = respropify_bert_att_k(base_model, att_reuse_percentage=att_reuse_percentage, lin_reuse_percentage=lin_reuse_percentage, lin_k=lin_k, att_k=att_k)
+
+    num_samples = len(train_dataset)
+    num_epochs = 5
+    num_samples_per_rank = num_samples // world_size
+    batch_size = 8
+    num_iters = num_samples_per_rank * num_epochs // batch_size
+
+    scaled_lin_schedule = [(x, y*num_samples_per_rank) for x, y in lin_schedule]
+    scaled_att_schedule = [(x, y*num_samples_per_rank) for x, y in att_schedule]
+
+
+    model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=lin_k, att_k=att_k)
     patch_bert_self_attention_k(model)
     model.to(device)
     # model = DDP(model, device_ids=[rank]) #wrap with DDP
 
     training_args = TrainingArguments(
-        output_dir=f"trainer_out/{model_name.replace('/', '-')}/rp_att_{int(att_reuse_percentage * 100)}_lin_{int(lin_reuse_percentage * 100)}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}/rank_{rank}", 
+        output_dir=f"trainer_out/{model_name.replace('/', '-')}/rp_att_{att_str}_lin_{lin_str}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}/rank_{rank}", 
         eval_strategy="steps",
-        num_train_epochs=5,
+        num_train_epochs=num_epochs,
         eval_steps=1/16,
         logging_steps=1/16,
-        logging_dir=f"trainer_out/{model_name.replace('/', '-')}/rp_att_{int(att_reuse_percentage * 100)}_lin_{int(lin_reuse_percentage * 100)}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}/rank_{rank}",
-        per_device_train_batch_size=8, #adjust batch size to fit on each GPU
-        per_device_eval_batch_size=8,
+        logging_dir=f"trainer_out/{model_name.replace('/', '-')}/rp_att_{att_str}_lin_{lin_str}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}/rank_{rank}",
+        per_device_train_batch_size=batch_size, #adjust batch size to fit on each GPU
+        per_device_eval_batch_size=batch_size,
         seed=seed,
         # local_rank=rank, #required for DDP
     )
@@ -264,7 +280,7 @@ def att_process(rank, world_size, lin_reuse_percentage, att_reuse_percentage, mo
 
     trainer.train()
     if rank == 0:
-        torch.save(trainer.state.log_history, f"log_history_att_{att_reuse_percentage}_lin_{lin_reuse_percentage}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}.pt")
+        torch.save(trainer.state.log_history, f"log_history_att_{att_str}_lin_{lin_str}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}.pt")
     # cleanup()
 
 def att_process_new(rank, world_size, lin_reuse_percentage, att_reuse_percentage, model_name, train_dataset, eval_dataset, seed=42, lin_k=1, att_k=1):
@@ -337,13 +353,12 @@ if __name__ == "__main__":
 
     seed = 45
     tokenized_datasets = dataset.map(tokenize_function, batched=True)
-    train_dataset = tokenized_datasets["train"].shuffle(seed=seed).select(range(3200))
+    train_dataset = tokenized_datasets["train"].shuffle(seed=seed).select(range(32000))
     eval_dataset = tokenized_datasets["test"].shuffle(seed=seed).select(range(1000))
 
-    lin_reuse_percentages = [0.9]
-    att_reuse_percentages = [0.9]
-    att_k_s = [1,2, 3, 4, 5]
-    lin_k_s = [1,2,3,4, 5, 10]
+
+    att_k_s = [1]
+    lin_k_s = [1]
     world_size = torch.cuda.device_count()
 
 
@@ -368,20 +383,23 @@ if __name__ == "__main__":
     # log_histories[f"lin_{lin_reuse_percentage}_att_{att_reuse_percentage}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}"] = torch.load(f"log_history_att_{att_reuse_percentage}_lin_{lin_reuse_percentage}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}.pt")
 
 
-    
-    for reuse_percentage in lin_reuse_percentages:
+    lin_reuse_schedules = [[(0.9,0)], [(0.9,0), (0.99, 0.3)], [(0.99,0.3), (0.9, 0.3)], [(0.99,0)]]
+    for reuse_schedule in lin_reuse_schedules:
         for k in lin_k_s:
-            lin_reuse_percentage = 0
-            att_reuse_percentage = reuse_percentage
+            lin_reuse_schedule = reuse_schedule
+            att_reuse_schedule = reuse_schedule
             lin_k = 1
             att_k = k
 
             mp.spawn(
                 att_process,
-                args=(world_size, lin_reuse_percentage, att_reuse_percentage, model_name, train_dataset, eval_dataset, seed, lin_k, att_k),
+                args=(world_size, lin_reuse_schedule, att_reuse_schedule, model_name, train_dataset, eval_dataset, seed, lin_k, att_k),
                 nprocs=world_size
             )
-            log_histories[f"lin_{lin_reuse_percentage}_att_{att_reuse_percentage}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}"] = torch.load(f"log_history_att_{att_reuse_percentage}_lin_{lin_reuse_percentage}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}.pt")
+            att_str = get_schedule_string(att_reuse_schedule)
+            lin_str = get_schedule_string(lin_reuse_schedule)
+
+            log_histories[f"lin_{lin_str}_att_{att_str}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}"] = torch.load(f"log_history_att_{att_str}_lin_{lin_str}_seed_{seed}_att_k_{att_k}_lin_k_{lin_k}.pt")
 
             # mp.spawn(
             #     att_process_new,
@@ -399,7 +417,7 @@ if __name__ == "__main__":
 
 
 
-    plot_log_histories(log_histories, file_name=f"resprop_k_both.png")
+    plot_log_histories(log_histories, file_name=f"resprop_warmup_both.png")
     # k_reuse_percentages = [0.5, 0.7, 0.9]
     # k_s = [1, 2, 3, 4, 5]
 

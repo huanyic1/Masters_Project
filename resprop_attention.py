@@ -96,7 +96,7 @@ class ReSpropLinear(nn.Linear):
 
         if output.requires_grad:
             def hook(grad_output):
-                self.step_counter[device] += 1
+                self.step_counter[device] += 1 
                 prev_grad_output = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
                 if self.step_counter[device] % self.k == 0:
                     prev_grad_input = torch.mm(prev_grad_output, self.weight.to(device))
