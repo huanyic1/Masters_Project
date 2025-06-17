@@ -67,8 +67,8 @@ def main():
     num_iters = (len(train_dataset) // world_size) * num_epochs // batch_size
     eval_steps = max(1, num_iters // 16)
 
-    scaled_lin_schedule = [(x, y * len(train_dataset) // world_size) for x, y in lin_schedule]
-    scaled_att_schedule = [(x, y * len(train_dataset) // world_size) for x, y in att_schedule]
+    scaled_lin_schedule = [(x, y * num_iters) for x, y in lin_schedule]
+    scaled_att_schedule = [(x, y * num_iters) for x, y in att_schedule]
 
     model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=args.lin_k, att_k=args.att_k)
     patch_bert_self_attention_k(model)

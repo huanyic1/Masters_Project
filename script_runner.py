@@ -8,16 +8,16 @@ import json
 lin_k_s = [1]
 att_k_s = [1]
 seed = 42
-model_name = "prajjwal1/bert-tiny" 
 reuse_schedule_path = "reuse_schedule.json"
+model_name = "prajjwal1/bert-tiny" 
 # model_name = 'bert-base-uncased'
 reuse_schedules = json.load(open(reuse_schedule_path))
 att_schedule = reuse_schedules[0]
 lin_schedule = reuse_schedules[1]
 file_name = "resprop_warmup_both.png"
-batch_size = 32
-num_epochs = 5
-train_samples = 8000
+batch_size = 128
+num_epochs = 10
+train_samples = 32000
 test_samples = 1000
 output_dir = "outputs"
 
@@ -61,3 +61,9 @@ for idx in range(len(att_schedule)):
 # 📈 Plot all histories
 plot_log_histories(log_histories, file_name="resprop_warmup_both.png")
 print("✅ Plot saved as resprop_warmup_both.png")
+
+
+# [
+# [[[0.0, 0]], [[0.0, 0], [0.7, 0.1]], [[0.0, 0], [0.9, 0.1]], [[0.0, 0], [0.99, 0.1]]],
+# [[[0.0, 0]], [[0.0, 0], [0.7, 0.1]], [[0.0, 0], [0.9, 0.1]], [[0.0, 0], [0.99, 0.1]]]
+# ]

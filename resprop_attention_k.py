@@ -88,6 +88,9 @@ class ReSpropLinear(nn.Linear):
 
         step = self.step_counter[device]
         reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step)
+        prev_reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step - 1)
+        if reuse_percentage != prev_reuse_percentage and (device.index is None or device.index == 0):
+            print('Switching REUSE_PERCENTAGE from', prev_reuse_percentage, 'to', reuse_percentage)
 
         output = ReSpropLinearFunction.apply(
             input, self.weight.to(device),
@@ -209,6 +212,9 @@ class ReSpropAttention(nn.Module):
         # Decide whether to recompute
         step = self.step_counter[device]
         reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step)
+        prev_reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step - 1)
+        if reuse_percentage != prev_reuse_percentage and (device.index is None or device.index == 0):
+            print('Switching REUSE_PERCENTAGE from', prev_reuse_percentage, 'to', reuse_percentage)
         should_recompute = (step % self.k == 0)
 
         if should_recompute and self.prev_gradients[device] is not None:
