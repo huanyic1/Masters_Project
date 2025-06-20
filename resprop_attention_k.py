@@ -13,7 +13,6 @@ class ReSpropLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, prev_grad_output, prev_grad_input, prev_grad_weight, reuse_percentage, step_counter, k):
         device = input.device
-        weight, bias = weight.to(device), bias.to(device) if bias is not None else None
         prev_grad_output = prev_grad_output.to(device) if prev_grad_output is not None else None
         prev_grad_input = prev_grad_input.to(device) if prev_grad_input is not None else None
         prev_grad_weight = prev_grad_weight.to(device) if prev_grad_weight is not None else None
@@ -45,7 +44,7 @@ class ReSpropLinearFunction(torch.autograd.Function):
 
             if ctx.reuse_percentage > 0:
                 threshold_idx = int(len(grad_diff.flatten()) * ctx.reuse_percentage)
-                threshold = torch.kthvalue(torch.abs(grad_diff).flatten(), threshold_idx)[0]
+                threshold = torch.quantile(torch.abs(grad_diff), ctx.reuse_percentage)
 
                 # Sparsify grad_output
                 reuse_mask = torch.abs(grad_diff) <= threshold
@@ -107,13 +106,6 @@ class ReSpropLinear(nn.Linear):
             def hook(grad_output):
                 self.step_counter[device] += 1
                 if self.step_counter[device] % self.k == 0:
-                    # prev_grad_output = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
-                    # prev_grad_input = torch.mm(prev_grad_output, self.weight.to(device))
-                    # prev_grad_weight = torch.mm(prev_grad_output.t(), torch.sum(input, dim=0))
-                    # sampled = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
-                    # self.prev_gradients[device] = prev_grad_output
-                    # self.prev_grad_input[device] = prev_grad_input
-                    # self.prev_grad_weight[device] = prev_grad_weight
 
                     idx = torch.randint(0, grad_output.size(0), (1,)).item()
                     sampled = grad_output[idx].sum(dim=0, keepdim=True).detach()  # [1, embed_dim]
@@ -175,7 +167,7 @@ class ReSpropAttentionFunction(torch.autograd.Function):
             grad_diff = current - previous
             if ctx.reuse_percentage > 0:
                 threshold_idx = int(len(grad_diff.flatten()) * ctx.reuse_percentage)
-                threshold = torch.kthvalue(torch.abs(grad_diff.flatten()), threshold_idx)[0]
+                threshold = torch.quantile(torch.abs(grad_diff), ctx.reuse_percentage)
                 reuse_mask = torch.abs(grad_diff) <= threshold
                 grad_diff = torch.where(reuse_mask, torch.tensor(0, device=grad_diff.device), grad_diff)
             return grad_diff + previous
@@ -271,14 +263,6 @@ class ReSpropAttention(nn.Module):
 
         if output.requires_grad:
             def hook(grad_output):
-                # self.step_counter[device] += 1
-                # rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
-                # sampled_grad = grad_output[rand_idx:rand_idx+1].clone().detach()
-                # self.prev_gradients[device] = {
-                #     "grad_output": sampled_grad,
-                #     "index": rand_idx
-                # }
-                # return None
                 self.step_counter[device] += 1
                 if self.step_counter[device] % self.k == 0:
                     rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
