@@ -13,9 +13,9 @@ class ReSpropLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, prev_grad_output, prev_grad_input, prev_grad_weight, reuse_percentage, step_counter, k):
         device = input.device
-        prev_grad_output = prev_grad_output.to(device) if prev_grad_output is not None else None
-        prev_grad_input = prev_grad_input.to(device) if prev_grad_input is not None else None
-        prev_grad_weight = prev_grad_weight.to(device) if prev_grad_weight is not None else None
+        prev_grad_output = prev_grad_output if prev_grad_output is not None else None
+        prev_grad_input = prev_grad_input if prev_grad_input is not None else None
+        prev_grad_weight = prev_grad_weight if prev_grad_weight is not None else None
         
         if prev_grad_output is not None and len(input.shape) == 3 and prev_grad_output.size(0) == input.size(1):
             pass
@@ -92,8 +92,8 @@ class ReSpropLinear(nn.Linear):
             print('Switching REUSE_PERCENTAGE from', prev_reuse_percentage, 'to', reuse_percentage)
 
         output = ReSpropLinearFunction.apply(
-            input, self.weight.to(device),
-            self.bias.to(device) if self.bias is not None else None,
+            input, self.weight,
+            self.bias if self.bias is not None else None,
             self.prev_gradients[device],
             self.prev_grad_input[device],
             self.prev_grad_weight[device],
@@ -118,7 +118,7 @@ class ReSpropLinear(nn.Linear):
                     self.prev_gradients[device] = sampled
 
                     # Compute input/weight grads based on sampled grad
-                    prev_input = torch.matmul(sampled, self.weight.to(device))
+                    prev_input = torch.matmul(sampled, self.weight)
                     prev_weight = prev_grad_weight
 
                     self.prev_grad_input[device] = prev_input.detach()
