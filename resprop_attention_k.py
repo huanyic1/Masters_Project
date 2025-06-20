@@ -107,13 +107,30 @@ class ReSpropLinear(nn.Linear):
             def hook(grad_output):
                 self.step_counter[device] += 1
                 if self.step_counter[device] % self.k == 0:
-                    prev_grad_output = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
-                    prev_grad_input = torch.mm(prev_grad_output, self.weight.to(device))
-                    prev_grad_weight = torch.mm(prev_grad_output.t(), torch.sum(input, dim=0))
-                    sampled = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
-                    self.prev_gradients[device] = prev_grad_output
-                    self.prev_grad_input[device] = prev_grad_input
-                    self.prev_grad_weight[device] = prev_grad_weight
+                    # prev_grad_output = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
+                    # prev_grad_input = torch.mm(prev_grad_output, self.weight.to(device))
+                    # prev_grad_weight = torch.mm(prev_grad_output.t(), torch.sum(input, dim=0))
+                    # sampled = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
+                    # self.prev_gradients[device] = prev_grad_output
+                    # self.prev_grad_input[device] = prev_grad_input
+                    # self.prev_grad_weight[device] = prev_grad_weight
+
+                    idx = torch.randint(0, grad_output.size(0), (1,)).item()
+                    sampled = grad_output[idx].sum(dim=0, keepdim=True).detach()  # [1, embed_dim]
+                    input_slice = input[idx]  # [seq_len, in_features]
+                    input_sum = input_slice.sum(dim=0, keepdim=True)  # [1, in_features]
+
+                    prev_grad_weight = sampled.t() @ input_sum  # [embed_dim, in_features]
+
+                    # Store for reuse
+                    self.prev_gradients[device] = sampled
+
+                    # Compute input/weight grads based on sampled grad
+                    prev_input = torch.matmul(sampled, self.weight.to(device))
+                    prev_weight = prev_grad_weight
+
+                    self.prev_grad_input[device] = prev_input.detach()
+                    self.prev_grad_weight[device] = prev_weight.detach()
             output.register_hook(hook)
         else:
             self.prev_gradients[device] = None
@@ -254,14 +271,22 @@ class ReSpropAttention(nn.Module):
 
         if output.requires_grad:
             def hook(grad_output):
+                # self.step_counter[device] += 1
+                # rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
+                # sampled_grad = grad_output[rand_idx:rand_idx+1].clone().detach()
+                # self.prev_gradients[device] = {
+                #     "grad_output": sampled_grad,
+                #     "index": rand_idx
+                # }
+                # return None
                 self.step_counter[device] += 1
-                rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
-                sampled_grad = grad_output[rand_idx:rand_idx+1].clone().detach()
-                self.prev_gradients[device] = {
-                    "grad_output": sampled_grad,
-                    "index": rand_idx
-                }
-                return None
+                if self.step_counter[device] % self.k == 0:
+                    rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
+                    sampled_grad = grad_output[rand_idx:rand_idx+1].clone().detach()
+                    self.prev_gradients[device] = {
+                        "grad_output": sampled_grad,
+                        "index": rand_idx
+                    }
 
             output.register_hook(hook)
         else:
