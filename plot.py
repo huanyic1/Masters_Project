@@ -9,7 +9,8 @@ def plot_log_histories(log_histories, file_name=None):
 
     for reuse_percentage, log_history in log_histories.items():
         log_history = [x for x in log_history]
-        label = "Baseline" if reuse_percentage == 0 else f"RP {int(reuse_percentage * 100)}%"
+        # label = "Baseline" if reuse_percentage == 0 else f"RP {int(reuse_percentage * 100)}% K={k}"
+        label = reuse_percentage
 
         loss_x = [x["epoch"] for x in log_history if "loss" in x]
         loss_y = [x["loss"] for x in log_history if "loss" in x]

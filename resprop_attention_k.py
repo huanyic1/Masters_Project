@@ -11,20 +11,19 @@ def get_current_reuse_percentage(reuse_schedule, step):
 
 class ReSpropLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, weight, bias, prev_grad_output, prev_grad_input, prev_grad_weight, reuse_percentage, step_counter, k):
-        device = input.device
+    def forward(ctx, input, weight, bias, prev_grad_output, prev_grad_input, prev_grad_weight, reuse_percentage):
         prev_grad_output = prev_grad_output if prev_grad_output is not None else None
         prev_grad_input = prev_grad_input if prev_grad_input is not None else None
         prev_grad_weight = prev_grad_weight if prev_grad_weight is not None else None
-        
+
         if prev_grad_output is not None and len(input.shape) == 3 and prev_grad_output.size(0) == input.size(1):
             pass
         else:
+            if prev_grad_output is not None:
+                print("Warning: Couldn't reuse gradient due to shape mis-match.")
             prev_grad_output = prev_grad_input = prev_grad_weight = None
 
         ctx.reuse_percentage = reuse_percentage
-        ctx.step_counter = step_counter
-        ctx.k = k
         ctx.save_for_backward(input, weight, bias, prev_grad_output, prev_grad_input, prev_grad_weight)
 
         output = torch.bmm(input, weight.t().expand(input.size(0), -1, -1))
@@ -43,14 +42,14 @@ class ReSpropLinearFunction(torch.autograd.Function):
             grad_diff = grad_output - prev_grad_output
 
             if ctx.reuse_percentage > 0:
-                threshold_idx = int(len(grad_diff.flatten()) * ctx.reuse_percentage)
-                threshold = torch.quantile(torch.abs(grad_diff), ctx.reuse_percentage)
-
+                abs_grad_diff = torch.abs(grad_diff)
+                threshold = torch.quantile(abs_grad_diff, ctx.reuse_percentage)
                 # Sparsify grad_output
-                reuse_mask = torch.abs(grad_diff) <= threshold
+                reuse_mask = abs_grad_diff <= threshold
                 grad_diff = torch.where(reuse_mask, torch.tensor(0, device=grad_diff.device), grad_diff)
 
             grad_output = grad_diff
+        
 
         # Compute gradients
         if ctx.needs_input_grad[0]:
@@ -87,9 +86,10 @@ class ReSpropLinear(nn.Linear):
 
         step = self.step_counter[device]
         reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step)
-        prev_reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step - 1)
-        if reuse_percentage != prev_reuse_percentage and (device.index is None or device.index == 0):
-            print('Switching REUSE_PERCENTAGE from', prev_reuse_percentage, 'to', reuse_percentage)
+
+        # prev_reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step - 1)
+        # if reuse_percentage != prev_reuse_percentage and (device.index is None or device.index == 0):
+        #     print('Switching REUSE_PERCENTAGE from', prev_reuse_percentage, 'to', reuse_percentage)
 
         output = ReSpropLinearFunction.apply(
             input, self.weight,
@@ -98,34 +98,21 @@ class ReSpropLinear(nn.Linear):
             self.prev_grad_input[device],
             self.prev_grad_weight[device],
             reuse_percentage, 
-            step,
-            self.k
         )
 
         if output.requires_grad:
             def hook(grad_output):
-                self.step_counter[device] += 1
                 if self.step_counter[device] % self.k == 0:
-
-                    idx = torch.randint(0, grad_output.size(0), (1,)).item()
-                    sampled = grad_output[idx].sum(dim=0, keepdim=True).detach()  # [1, embed_dim]
-                    input_slice = input[idx]  # [seq_len, in_features]
-                    input_sum = input_slice.sum(dim=0, keepdim=True)  # [1, in_features]
-
-                    prev_grad_weight = sampled.t() @ input_sum  # [embed_dim, in_features]
-
-                    # Store for reuse
-                    self.prev_gradients[device] = sampled
-
-                    # Compute input/weight grads based on sampled grad
-                    prev_input = torch.matmul(sampled, self.weight)
-                    prev_weight = prev_grad_weight
-
-                    self.prev_grad_input[device] = prev_input.detach()
-                    self.prev_grad_weight[device] = prev_weight.detach()
+                    prev_grad_output = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
+                    prev_grad_input = torch.mm(prev_grad_output, self.weight)
+                    prev_grad_weight = torch.mm(prev_grad_output.t(), torch.sum(input, dim=0))
+                    sampled = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
+                    self.prev_gradients[device] = prev_grad_output
+                    self.prev_grad_input[device] = prev_grad_input
+                    self.prev_grad_weight[device] = prev_grad_weight     
+                self.step_counter[device] += 1
+                
             output.register_hook(hook)
-        else:
-            self.prev_gradients[device] = None
 
         return output
 
