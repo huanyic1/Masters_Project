@@ -1,5 +1,3 @@
-# train_resprop.py
-
 import argparse
 import torch
 import numpy as np

@@ -1,12 +1,10 @@
-# run_all.py
-
 import subprocess
 import torch
 from plot import plot_log_histories
 import json
 
 lin_k_s = [1]
-att_k_s = [1]
+att_k_s = [1,3]
 seed = 42
 reuse_schedule_path = "reuse_schedule.json"
 model_name = "prajjwal1/bert-tiny" 
@@ -16,7 +14,7 @@ att_schedule = reuse_schedules[0]
 lin_schedule = reuse_schedules[1]
 file_name = "resprop_warmup_both.png"
 batch_size = 128
-num_epochs = 10
+num_epochs = 15
 train_samples = 32000
 test_samples = 1000
 output_dir = "outputs"
@@ -63,7 +61,3 @@ plot_log_histories(log_histories, file_name="resprop_warmup_both.png")
 print("✅ Plot saved as resprop_warmup_both.png")
 
 
-# [
-# [[[0.0, 0]], [[0.0, 0], [0.7, 0.1]], [[0.0, 0], [0.9, 0.1]], [[0.0, 0], [0.99, 0.1]]],
-# [[[0.0, 0]], [[0.0, 0], [0.7, 0.1]], [[0.0, 0], [0.9, 0.1]], [[0.0, 0], [0.99, 0.1]]]
-# ]

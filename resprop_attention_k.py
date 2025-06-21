@@ -50,7 +50,6 @@ class ReSpropLinearFunction(torch.autograd.Function):
 
             grad_output = grad_diff
         
-
         # Compute gradients
         if ctx.needs_input_grad[0]:
             grad_input = torch.bmm(grad_output, weight.expand(grad_output.size(0), -1, -1))
@@ -122,55 +121,75 @@ class ReSpropLinear(nn.Linear):
         
 class ReSpropAttentionFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, prev_grad_Q, prev_grad_K, prev_grad_V, reuse_percentage):
+    def forward(ctx, Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod, reuse_percentage):
+        """
+        prev_grad_output = dL/dZ_prev
+        prev_attn_prod = A.T * dL/dZ_prev
+        prev_V_prod = dL/dZ_prev * V.T
+        prev_soft_grad = dL/dSoftmax_prev
+        prev_K_prod = dL/dSoftmax_prev * K
+        prev_Q_prod = dL/dSoftmax_prev.T * Q
+        """
         ctx.reuse_percentage = reuse_percentage
-        ctx.save_for_backward(Q, K, V, prev_grad_Q, prev_grad_K, prev_grad_V)
-        d_k = Q.size(-1)
+        ctx.save_for_backward(Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod)
 
+        d_k = Q.size(-1)
         attn_scores = torch.bmm(Q, K.transpose(1, 2)) / (d_k ** 0.5)
         attn_probs = torch.softmax(attn_scores, dim=-1)
-        ctx.attn_probs = attn_probs
+        ctx.attn_probs = attn_probs  # current softmax
 
         return torch.bmm(attn_probs, V)
 
     @staticmethod
     def backward(ctx, grad_output):
-        Q, K, V, prev_grad_Q, prev_grad_K, prev_grad_V = ctx.saved_tensors
+        Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod = ctx.saved_tensors
         attn_probs = ctx.attn_probs
         d_k = Q.size(-1)
+        grad_Q=grad_K=grad_V=None
 
-        grad_attn_probs = torch.bmm(grad_output, V.transpose(1, 2))
-        grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_output)
+        if prev_grad_output is not None:
+            grad_diff = grad_output - prev_grad_output
+            if ctx.reuse_percentage > 0:
+                grad_abs_diff = torch.abs(grad_diff)
+                threshold = torch.quantile(grad_abs_diff, ctx.reuse_percentage)
+                reuse_mask = grad_abs_diff <= threshold
+                grad_diff = torch.where(reuse_mask, torch.tensor(0, device=grad_diff.device), grad_diff)
+            
+            grad_attn_probs = torch.bmm(grad_diff, V.transpose(1, 2)) + prev_V_prod
+            if ctx.needs_input_grad[2]:
+                grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_diff) + prev_attn_prod
+        else: 
+            grad_attn_probs = torch.bmm(grad_output, V.transpose(1, 2))
+            if ctx.needs_input_grad[2]:
+                grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_output)
+
 
         grad_attn_scores = grad_attn_probs * attn_probs
         grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
         grad_attn_scores /= (d_k ** 0.5)
 
-        grad_Q = torch.bmm(grad_attn_scores, K)
-        grad_K = torch.bmm(grad_attn_scores.transpose(1, 2), Q)
-
-        # Apply reuse
-        def sparsify(current, previous):
-            grad_diff = current - previous
+        if prev_soft_grad is not None:
+            grad_attn_diff = grad_attn_scores - prev_soft_grad
             if ctx.reuse_percentage > 0:
-                threshold_idx = int(len(grad_diff.flatten()) * ctx.reuse_percentage)
-                threshold = torch.quantile(torch.abs(grad_diff), ctx.reuse_percentage)
-                reuse_mask = torch.abs(grad_diff) <= threshold
-                grad_diff = torch.where(reuse_mask, torch.tensor(0, device=grad_diff.device), grad_diff)
-            return grad_diff + previous
+                grad_attn_abs_diff = torch.abs(grad_attn_diff)
+                threshold = torch.quantile(grad_attn_abs_diff, ctx.reuse_percentage)
+                reuse_mask = grad_attn_abs_diff <= threshold
+                grad_attn_diff = torch.where(reuse_mask, torch.tensor(0, device=grad_attn_diff.device), grad_attn_diff)
+            if ctx.needs_input_grad[0]:
+                grad_Q = torch.bmm(grad_attn_diff, K) + prev_K_prod
+            if ctx.needs_input_grad[1]:
+                grad_K = torch.bmm(grad_attn_diff.transpose(1, 2), Q) + prev_Q_prod
+        else: 
+            if ctx.needs_input_grad[0]:
+                grad_Q = torch.bmm(grad_attn_scores, K)
+            if ctx.needs_input_grad[1]:
+                grad_K = torch.bmm(grad_attn_scores.transpose(1, 2), Q)
 
-        if prev_grad_Q is not None:
-            grad_Q = sparsify(grad_Q, prev_grad_Q)
-        if prev_grad_K is not None:
-            grad_K = sparsify(grad_K, prev_grad_K)
-        if prev_grad_V is not None:
-            grad_V = sparsify(grad_V, prev_grad_V)
-
-        return grad_Q, grad_K, grad_V, None, None, None, None
+        return grad_Q, grad_K, grad_V, None, None, None, None, None, None, None
    
-
 def resprop_linear(layer: nn.Linear, reuse_schedule=None, k=1):
     return ReSpropLinear(layer.in_features, layer.out_features, layer.bias is not None, reuse_schedule=reuse_schedule, k=k)
+
 class ReSpropAttention(nn.Module):
     def __init__(self, embed_dim, reuse_schedule=None, lin_reuse_schedule=None, att_k=1, lin_k=1):
         super().__init__()
@@ -187,81 +206,80 @@ class ReSpropAttention(nn.Module):
             self.k_proj = nn.Linear(embed_dim, embed_dim)
             self.v_proj = nn.Linear(embed_dim, embed_dim)
 
-        self.prev_gradients = {}  # stores grad_output and index
-        self.prev_grad_Q = {}
-        self.prev_grad_K = {}
-        self.prev_grad_V = {}
+        self.prev_grad_output = {}  # stores grad_output and index
+        self.prev_attn_prods = {}
+        self.prev_V_prods = {}
+        self.prev_soft_grads = {}
+        self.prev_K_prods = {}
+        self.prev_Q_prods = {}
         self.step_counter = {}
 
     def forward(self, hidden_states):
         device = hidden_states.device
         self.step_counter.setdefault(device, 0)
-        self.prev_gradients.setdefault(device, None)
-        self.prev_grad_Q.setdefault(device, None)
-        self.prev_grad_K.setdefault(device, None)
-        self.prev_grad_V.setdefault(device, None)
+        self.prev_grad_output.setdefault(device, None)
+        self.prev_attn_prods.setdefault(device, None)
+        self.prev_V_prods.setdefault(device, None)
+        self.prev_soft_grads.setdefault(device, None)
+        self.prev_K_prods.setdefault(device, None)
+        self.prev_Q_prods.setdefault(device, None)
 
+        reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, self.step_counter[device])
+        
+        # prev_reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step - 1)
+        # if reuse_percentage != prev_reuse_percentage and (device.index is None or device.index == 0):
+        #     print('Switching REUSE_PERCENTAGE from', prev_reuse_percentage, 'to', reuse_percentage)
+        
         Q = self.q_proj(hidden_states)
         K = self.k_proj(hidden_states)
         V = self.v_proj(hidden_states)
 
-        # Decide whether to recompute
-        step = self.step_counter[device]
-        reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step)
-        prev_reuse_percentage = get_current_reuse_percentage(self.reuse_schedule, step - 1)
-        if reuse_percentage != prev_reuse_percentage and (device.index is None or device.index == 0):
-            print('Switching REUSE_PERCENTAGE from', prev_reuse_percentage, 'to', reuse_percentage)
-        should_recompute = (step % self.k == 0)
-
-        if should_recompute and self.prev_gradients[device] is not None:
-            with torch.no_grad():
-                grad_output = self.prev_gradients[device]["grad_output"]
-                idx = self.prev_gradients[device]["index"]
-
-                V_slice = V[idx:idx+1]
-                Q_slice = Q[idx:idx+1]
-                K_slice = K[idx:idx+1]
-
-                d_k = Q.size(-1)
-                attn_scores = torch.bmm(Q_slice, K_slice.transpose(1, 2)) / (d_k ** 0.5)
-                attn_probs = torch.softmax(attn_scores, dim=-1)
-
-                grad_attn_probs = torch.bmm(grad_output, V_slice.transpose(1, 2))
-                grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_output)
-
-                grad_attn_scores = grad_attn_probs * attn_probs
-                grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
-                grad_attn_scores /= (d_k ** 0.5)
-
-                grad_Q = torch.bmm(grad_attn_scores, K_slice)
-                grad_K = torch.bmm(grad_attn_scores.transpose(1, 2), Q_slice)
-
-                self.prev_grad_Q[device] = grad_Q.detach()
-                self.prev_grad_K[device] = grad_K.detach()
-                self.prev_grad_V[device] = grad_V.detach()
-
         output = ReSpropAttentionFunction.apply(
             Q, K, V,
-            self.prev_grad_Q[device],
-            self.prev_grad_K[device],
-            self.prev_grad_V[device],
+            self.prev_grad_output[device],
+            self.prev_attn_prods[device],
+            self.prev_V_prods[device],
+            self.prev_soft_grads[device],
+            self.prev_K_prods[device],
+            self.prev_Q_prods[device],
             reuse_percentage
         )
-
         if output.requires_grad:
             def hook(grad_output):
-                self.step_counter[device] += 1
                 if self.step_counter[device] % self.k == 0:
-                    rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
-                    sampled_grad = grad_output[rand_idx:rand_idx+1].clone().detach()
-                    self.prev_gradients[device] = {
-                        "grad_output": sampled_grad,
-                        "index": rand_idx
-                    }
+                    with torch.no_grad():
+                        rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
+                        sampled_grad = grad_output[rand_idx:rand_idx+1].detach()
+
+                        Q_ = Q[rand_idx:rand_idx+1]
+                        K_ = K[rand_idx:rand_idx+1]
+                        V_ = V[rand_idx:rand_idx+1]
+                        d_k = Q.size(-1)
+
+                        attn_scores = torch.bmm(Q_, K_.transpose(1, 2)) / (d_k ** 0.5)
+                        attn_probs = torch.softmax(attn_scores, dim=-1)
+
+                        attn_prod = torch.bmm(attn_probs.transpose(1, 2), sampled_grad)
+                        V_prod = torch.bmm(sampled_grad, V_.transpose(1, 2))
+
+                        grad_softmax = torch.bmm(sampled_grad, V_.transpose(1, 2))
+                        grad_attn_scores = grad_softmax * attn_probs
+                        grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
+                        grad_attn_scores /= (d_k ** 0.5)
+
+                        K_prod = torch.bmm(grad_attn_scores, K_)
+                        Q_prod = torch.bmm(grad_attn_scores.transpose(1, 2), Q_)
+
+                        self.prev_grad_output[device] = sampled_grad
+                        self.prev_attn_prods[device] = attn_prod.detach()
+                        self.prev_V_prods[device] = V_prod.detach()
+                        self.prev_soft_grads[device] = grad_attn_scores.detach()
+                        self.prev_K_prods[device] = K_prod.detach()
+                        self.prev_Q_prods[device] = Q_prod.detach()
+
+                self.step_counter[device] += 1
 
             output.register_hook(hook)
-        else:
-            self.prev_gradients[device] = None
 
         return output
 
@@ -296,7 +314,6 @@ def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedul
         layer.output.dense = resprop_linear(layer.output.dense)
 
     return model
-
 
 
 def patch_bert_self_attention_k(model):
