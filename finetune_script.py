@@ -9,9 +9,9 @@ import os
 import torch.distributed as dist
 import json
 
-reuse_schedule_path = "reuse_schedule.json"
+reuse_schedule_path = "reuse_schedule_finetune.json"
 REUSE_SCHEDULES = json.load(open(reuse_schedule_path))
-output_dir = "outputs"
+output_dir = "outputs_finetune"
 
 
 def cleanup():

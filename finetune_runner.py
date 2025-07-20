@@ -4,11 +4,11 @@ from plot import plot_log_histories
 import json
 
 lin_k_s = [1]
-att_k_s = [1,3]
+att_k_s = [1]
 seed = 42
-reuse_schedule_path = "reuse_schedule.json"
-model_name = "prajjwal1/bert-tiny" 
-# model_name = 'bert-base-uncased'
+reuse_schedule_path = "reuse_schedule_finetune.json"
+# model_name = "prajjwal1/bert-tiny" 
+model_name = 'bert-base-uncased'
 reuse_schedules = json.load(open(reuse_schedule_path))
 att_schedule = reuse_schedules[0]
 lin_schedule = reuse_schedules[1]
@@ -17,7 +17,7 @@ batch_size = 128
 num_epochs = 15
 train_samples = 32000
 test_samples = 1000
-output_dir = "outputs"
+output_dir = "outputs_finetune"
 
 def get_schedule_string(schedule):
     return ','.join(f'(rp: {x}, start: {y})' for x, y in schedule)
@@ -38,7 +38,7 @@ for idx in range(len(att_schedule)):
             subprocess.run([
                 "torchrun",
                 f"--nproc-per-node={world_size}",
-                "training_script.py",
+                "finetune_script.py",
                 f"--reuse_schedule_idx={idx}",
                 f"--att_k={att_k}",
                 f"--lin_k={lin_k}",
