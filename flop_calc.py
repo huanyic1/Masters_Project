@@ -173,6 +173,7 @@ class ReSpropLinear(nn.Linear):
 
     def extra_repr(self):
         return super().extra_repr() + f", reuse_percentage={self.reuse_percentage}"
+
         
 class ReSpropAttentionFunction(torch.autograd.Function):
     @staticmethod
@@ -201,11 +202,12 @@ class ReSpropAttentionFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod = ctx.saved_tensors
+        
         attn_probs = ctx.attn_probs
         d_k = Q.size(-1)
         grad_Q=grad_K=grad_V=None
 
-        if prev_grad_output is not None:
+        if prev_grad_output is not None and ctx.reuse_percentage > 0:
             grad_diff = generate_reuse_mask(ctx.reuse_percentage, grad_output, prev_grad_output, ctx.structured, ctx.n, ctx.group_size)
             grad_attn_probs = torch.bmm(grad_diff, V.transpose(1, 2)) + prev_V_prod
             if ctx.needs_input_grad[2]:
@@ -220,12 +222,13 @@ class ReSpropAttentionFunction(torch.autograd.Function):
         grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
         grad_attn_scores /= (d_k ** 0.5)
 
-        if prev_soft_grad is not None:
+        if prev_soft_grad is not None and ctx.reuse_percentage > 0:
             grad_attn_diff = generate_reuse_mask(ctx.reuse_percentage, grad_attn_scores, prev_soft_grad, ctx.structured, ctx.n, ctx.group_size)
             if ctx.needs_input_grad[0]:
                 grad_Q = torch.bmm(grad_attn_diff, K) + prev_K_prod
             if ctx.needs_input_grad[1]:
                 grad_K = torch.bmm(grad_attn_diff.transpose(1, 2), Q) + prev_Q_prod
+            # print('REUSING GRADIENT2')
         else: 
             if ctx.needs_input_grad[0]:
                 grad_Q = torch.bmm(grad_attn_scores, K)
@@ -302,27 +305,26 @@ class ReSpropAttention(nn.Module):
             def hook(grad_output):
                 if self.step_counter[device] % self.k == 0:
                     with torch.no_grad():
-                        rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
-                        sampled_grad = grad_output[rand_idx:rand_idx+1].detach()
+                        sampled_grad = grad_output.mean(dim=0, keepdim=True).detach()  # [1, T, d]
 
-                        Q_ = Q[rand_idx:rand_idx+1]
-                        K_ = K[rand_idx:rand_idx+1]
-                        V_ = V[rand_idx:rand_idx+1]
+                        Q_ = Q.mean(dim=0, keepdim=True)  # [1, T, d_k]
+                        K_ = K.mean(dim=0, keepdim=True)  # [1, T, d_k]
+                        V_ = V.mean(dim=0, keepdim=True)  # [1, T, d_v]
                         d_k = Q.size(-1)
 
-                        attn_scores = torch.bmm(Q_, K_.transpose(1, 2)) / (d_k ** 0.5)
-                        attn_probs = torch.softmax(attn_scores, dim=-1)
+                        attn_scores = torch.bmm(Q_, K_.transpose(1, 2)) / (d_k ** 0.5)  # [1, T, T]
+                        attn_probs = torch.softmax(attn_scores, dim=-1)                 # [1, T, T]
 
-                        attn_prod = torch.bmm(attn_probs.transpose(1, 2), sampled_grad)
-                        V_prod = torch.bmm(sampled_grad, V_.transpose(1, 2))
+                        attn_prod = torch.bmm(attn_probs.transpose(1, 2), sampled_grad)  # [1, T, d]
+                        V_prod = torch.bmm(sampled_grad, V_.transpose(1, 2))             # [1, d, T]
 
-                        grad_softmax = torch.bmm(sampled_grad, V_.transpose(1, 2))
-                        grad_attn_scores = grad_softmax * attn_probs
+                        grad_softmax = torch.bmm(sampled_grad, V_.transpose(1, 2))       # [1, T, T]
+                        grad_attn_scores = grad_softmax * attn_probs                     # [1, T, T]
                         grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
                         grad_attn_scores /= (d_k ** 0.5)
 
-                        K_prod = torch.bmm(grad_attn_scores, K_)
-                        Q_prod = torch.bmm(grad_attn_scores.transpose(1, 2), Q_)
+                        K_prod = torch.bmm(grad_attn_scores, K_)                         # [1, T, d]
+                        Q_prod = torch.bmm(grad_attn_scores.transpose(1, 2), Q_)         # [1, T, d]
 
                         self.prev_grad_output[device] = sampled_grad
                         self.prev_attn_prods[device] = attn_prod.detach()
@@ -342,7 +344,7 @@ class ReSpropAttention(nn.Module):
         return f"embed_dim={self.embed_dim}, reuse_percentage={self.reuse_percentage}"
 
 
-def respropify_bert_att_k_old(base_model, att_reuse_schedule=None, lin_reuse_schedule=None, lin_k=1, att_k=1):
+def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedule=None, lin_k=1, att_k=1):
     model = copy.deepcopy(base_model).to(torch.cuda.current_device())
 
     def resprop_attention_block(embed_dim):
@@ -370,7 +372,7 @@ def respropify_bert_att_k_old(base_model, att_reuse_schedule=None, lin_reuse_sch
     return model
 
 
-def patch_bert_self_attention_k_old(model):
+def patch_bert_self_attention_k(model):
     for layer in model.bert.encoder.layer:
         attn_self = layer.attention.self
 

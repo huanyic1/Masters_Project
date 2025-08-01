@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import argparse
+from resprop_attention_k import respropify_bert_att_k, patch_bert_self_attention_k, ReSpropAttention, ReSpropLinear
+from resprop_linear import resprofify_bert
 
 import torch
 from datasets import load_from_disk, concatenate_datasets
@@ -13,6 +15,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+import json
 
 def parse_args():
     p = argparse.ArgumentParser(description="Resume BERT pre-training with torchrun + DDP")
@@ -61,6 +64,8 @@ def parse_args():
         default=4,
         help="Number of workers for DataLoader / map",
     )
+    p.add_argument("--resume_path", type=str, default=None)
+    p.add_argument("--resume_step", type=int, default=0)
     return p.parse_args()
 
 def main():
@@ -73,18 +78,52 @@ def main():
 
     # 2) tokenizer & model
     tokenizer = AutoTokenizer.from_pretrained(args.token_path, use_fast=True)
-    config = BertConfig(
-        vocab_size=tokenizer.vocab_size,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
-        max_position_embeddings=128,
-        type_vocab_size=2,
-        pad_token_id=tokenizer.pad_token_id,
-    )
 
-    model = BertForMaskedLM(config)
+
+    att_schedule = [[0, 0], ["2:4", 0.2]]
+    lin_schedule = [[0, 0], ["2:4", 0.2]]
+    num_epochs = args.epochs
+    batch_size = args.batch_size
+    num_iters = (len(train_ds) // args.num_proc) * num_epochs // batch_size
+
+    scaled_lin_schedule = [(x, y * num_iters) for x, y in lin_schedule]
+    scaled_att_schedule = [(x, y * num_iters) for x, y in att_schedule]
+
+    if not args.resume_path:
+        config = BertConfig(
+            vocab_size=tokenizer.vocab_size,
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            max_position_embeddings=128,
+            type_vocab_size=2,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        base_model = BertForMaskedLM(config)
+    else:
+        base_model = BertForMaskedLM.from_pretrained(args.resume_path)
+
+    # model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
+    # patch_bert_self_attention_k(model)
+    model = resprofify_bert(base_model, reuse_schedule=scaled_lin_schedule)
+    if args.resume_path:
+        # Get step from trainer state
+        trainer_state_file = os.path.join(args.resume_path, "trainer_state.json")
+        if os.path.exists(trainer_state_file):
+            with open(trainer_state_file, "r") as f:
+                trainer_state = json.load(f)
+            resume_step = trainer_state.get("global_step", 0)
+        else:
+            print("⚠️ Warning: trainer_state.json not found. Defaulting to resume_step = 0")
+            resume_step = 0
+
+        # Set step counter in ReSprop modules
+        for module in model.modules():
+            if isinstance(module, (ReSpropLinear, ReSpropAttention)):
+                for device in module.step_counter:
+                    module.step_counter[device] = resume_step
+
 
     # 3) data collator for MLM
     data_collator = DataCollatorForLanguageModeling(
@@ -101,7 +140,7 @@ def main():
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        fp16=True,
+        fp16=False,
         save_total_limit=3,
         save_steps=10_000,
         logging_steps=500,
@@ -120,7 +159,7 @@ def main():
     )
 
     # 6) resume training
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_path)
 
     # 7) final save
     trainer.save_model(args.output_dir)
@@ -129,169 +168,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# import argparse
-# import logging
-# import os
-# import torch
-# from accelerate import Accelerator
-# from datasets import load_from_disk, concatenate_datasets
-# from transformers import (
-#     BertConfig,
-#     BertForPreTraining,
-#     AutoTokenizer,
-#     DataCollatorForLanguageModeling,
-#     get_scheduler,
-#     set_seed,
-# )
-# from torch.optim import AdamW
-# from tqdm.auto import tqdm
-
-# logging.basicConfig(
-#     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-#     datefmt="%m/%d/%Y %H:%M:%S",
-#     level=logging.INFO,
-# )
-# logger = logging.getLogger(__name__)
-
-# def parse_args():
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--output_dir", type=str, default="./bert_from_scratch")
-#     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
-#     parser.add_argument("--dataset_cache_dir", type=str, default="./cached_openweb")
-#     parser.add_argument("--block_size", type=int, default=128)
-#     parser.add_argument("--tokenizer_name_or_path", type=str, default="bert-base-uncased")
-#     parser.add_argument("--mlm_probability", type=float, default=0.15)
-#     parser.add_argument("--per_device_train_batch_size", type=int, default=128)
-#     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-#     parser.add_argument("--learning_rate", type=float, default=5e-5)
-#     parser.add_argument("--weight_decay", type=float, default=0.01)
-#     parser.add_argument("--steps_per_shard", type=int, default=10000)
-#     parser.add_argument("--lr_scheduler_type", type=str, default="linear",
-#                         choices=["linear", "cosine", "polynomial", "constant", "constant_with_warmup"])
-#     parser.add_argument("--num_warmup_steps", type=int, default=0)
-#     parser.add_argument("--seed", type=int, default=42)
-#     parser.add_argument("--with_tracking", action="store_true", default=True)
-#     parser.add_argument("--report_to", type=str, default="all")
-#     parser.add_argument("--resume_from_checkpoint", action="store_true")
-#     parser.add_argument("--reset_shard_id", action="store_true")
-#     return parser.parse_args()
-
-# def main():
-#     args = parse_args()
-#     accelerator = Accelerator(log_with=args.report_to, project_dir=args.output_dir)
-
-#     if accelerator.is_main_process:
-#         logger.setLevel(logging.INFO)
-#     else:
-#         logger.setLevel(logging.ERROR)
-#     set_seed(args.seed)
-
-#     os.makedirs(args.output_dir, exist_ok=True)
-#     os.makedirs(args.checkpoint_dir, exist_ok=True)
-
-#     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path)
-
-#     logger.info("Loading preprocessed dataset...")
-#     owt = load_from_disk(os.path.join(args.dataset_cache_dir, "owt_preprocessed"))
-#     wiki = load_from_disk(os.path.join(args.dataset_cache_dir, "wiki_preprocessed"))
-#     dataset = concatenate_datasets([owt, wiki])
-#     print('DATASET SHAPE', dataset.shape)
-
-#     logger.info("Filtering sequences of incorrect length...")
-#     # Filter sequences where input_ids isn't exactly block_size
-#     expected_length = args.block_size
-#     def is_valid(example):
-#         return (
-#             len(example["input_ids"]) == args.block_size and
-#             len(example.get("attention_mask", [])) == args.block_size and
-#             len(example.get("token_type_ids", [])) == args.block_size
-#         )
-
-#     dataset = dataset.filter(is_valid, num_proc=4)
-
-#     data_collator = DataCollatorForLanguageModeling(
-#         tokenizer=tokenizer,
-#         mlm=True,
-#         mlm_probability=0.15,
-#         pad_to_multiple_of=args.block_size,  # Optional: aligns for tensor cores
-#     )
-#     config = BertConfig(
-#         vocab_size=tokenizer.vocab_size,
-#         hidden_size=768,
-#         num_hidden_layers=12,
-#         num_attention_heads=12,
-#         intermediate_size=3072,
-#         max_position_embeddings=args.block_size,
-#         type_vocab_size=2,
-#         pad_token_id=tokenizer.pad_token_id,
-#     )
-
-#     model = BertForPreTraining(config)
-
-#     if args.with_tracking:
-#         accelerator.init_trackers("bert_pretraining_from_scratch")
-
-#     train_loader = torch.utils.data.DataLoader(
-#         dataset,
-#         batch_size=args.per_device_train_batch_size,
-#         collate_fn=data_collator,
-#         shuffle=True,
-#         num_workers=2,
-#     )
-
-#     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-#     lr_scheduler = get_scheduler(
-#         name=args.lr_scheduler_type,
-#         optimizer=optimizer,
-#         num_warmup_steps=args.num_warmup_steps,
-#         num_training_steps=args.steps_per_shard,
-#     )
-
-#     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
-#     model.train()
-
-#     completed_steps = 0
-#     progress_bar = tqdm(range(args.steps_per_shard), disable=not accelerator.is_main_process)
-
-#     for step, batch in enumerate(train_loader):
-#         if completed_steps >= args.steps_per_shard:
-#             break
-
-#         batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-#         batch.setdefault("token_type_ids", torch.zeros_like(batch["input_ids"]))
-#         batch.setdefault("next_sentence_label", torch.zeros(batch["input_ids"].shape[0], dtype=torch.long))
-
-#         allowed_keys = {"input_ids", "attention_mask", "token_type_ids", "next_sentence_label", "labels"}
-#         filtered_batch = {k: v for k, v in batch.items() if k in allowed_keys}
-
-#         print("input_ids shape:", batch["input_ids"].shape)
-
-#         if batch["input_ids"].dim() == 3 and batch["input_ids"].size(1) == 1:
-#             batch["input_ids"] = batch["input_ids"].squeeze(1)
-
-#         loss = model(**filtered_batch).loss / args.gradient_accumulation_steps
-#         accelerator.backward(loss)
-
-#         if step % args.gradient_accumulation_steps == 0:
-#             optimizer.step()
-#             lr_scheduler.step()
-#             optimizer.zero_grad()
-#             progress_bar.update(1)
-#             completed_steps += 1
-
-#             if accelerator.is_main_process:
-#                 accelerator.log({"loss": loss.item() * args.gradient_accumulation_steps}, step=completed_steps)
-
-#     accelerator.wait_for_everyone()
-#     if accelerator.is_main_process:
-#         unwrapped_model = accelerator.unwrap_model(model)
-#         save_path = os.path.join(args.checkpoint_dir, "checkpoint_final")
-#         unwrapped_model.save_pretrained(save_path, save_function=accelerator.save)
-#         tokenizer.save_pretrained(save_path)
-#         logger.info(f"Saved final checkpoint at {save_path}")
-#         if args.with_tracking:
-#             accelerator.end_training()
-
-# if __name__ == "__main__":
-#     main()

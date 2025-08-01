@@ -4,6 +4,7 @@ import numpy as np
 from transformers import AutoTokenizer, BertForSequenceClassification, TrainingArguments, Trainer
 from datasets import load_dataset
 from resprop_attention_k import respropify_bert_att_k, patch_bert_self_attention_k
+from resprop_linear import respropify_bert
 from evaluate import load as load_metric
 import os
 import torch.distributed as dist
@@ -31,6 +32,8 @@ def main():
     parser.add_argument('--num_test', type=int, default=1000)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_epochs', type=int, default=5)
+    parser.add_argument('--reuse_percentage', type=float)
+    parser.add_argument('--baseline', default=False)
 
     args = parser.parse_args()
     rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -68,12 +71,20 @@ def main():
     scaled_lin_schedule = [(x, y * num_iters) for x, y in lin_schedule]
     scaled_att_schedule = [(x, y * num_iters) for x, y in att_schedule]
 
-    model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=args.lin_k, att_k=args.att_k)
-    patch_bert_self_attention_k(model)
+
+    if args.baseline:
+        model = base_model
+        save_name = f"{output_dir}/log_history_baseline_seed_{args.seed}.pt"
+        output_d = f"trainer_out/{model_name.replace('/', '-')}/baseline_seed_{args.seed}"
+    else: 
+        model = respropify_bert_att_k(base_model, lin_reuse_schedule=scaled_lin_schedule, att_reuse_schedule=scaled_att_schedule)
+        patch_bert_self_attention_k(model)
+        output_d = f"trainer_out/{model_name.replace('/', '-')}/rp_att_{att_str}_lin_{lin_str}_seed_{args.seed}"
+        save_name = f"{output_dir}/log_history_att_{att_str}_lin_{lin_str}_seed_{args.seed}_new.pt"
     model.to(device)
 
     training_args = TrainingArguments(
-        output_dir=f"trainer_out/{model_name.replace('/', '-')}/rp_att_{att_str}_lin_{lin_str}_seed_{args.seed}_att_k_{args.att_k}_lin_k_{args.lin_k}",
+        output_dir=output_d,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         num_train_epochs=num_epochs,
@@ -100,9 +111,9 @@ def main():
     )
 
     trainer.train()
-    if rank == 0:
-        torch.save(trainer.state.log_history,
-                   f"{output_dir}/log_history_att_{att_str}_lin_{lin_str}_seed_{args.seed}_att_k_{args.att_k}_lin_k_{args.lin_k}.pt")
+
+    torch.save(trainer.state.log_history,
+                   save_name)
 
 
     cleanup()

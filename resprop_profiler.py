@@ -4,12 +4,49 @@ import torch.nn.functional as F
 import copy
 import math
 import types
+import time
+from contextlib import contextmanager
+timer_count ={}
+timer_count['hook_flops'] = 0
+timer_count['backward_flops'] = 0
+@contextmanager
+def cuda_timer(label):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    yield
+    end.record()
+    torch.cuda.synchronize()
+    elapsed_time = start.elapsed_time(end)
+    print(f"[TIMER] {label}: {elapsed_time:.3f} ms")
 
-def get_current_reuse_percentage(reuse_schedule, step): 
+def log_time(tag, start_time):
+    torch.cuda.synchronize()
+    if tag not in timer_count:
+        timer_count[tag] = 0
+    timer_count[tag] += time.time() - start_time
+
+def count_bmm_flops(A: torch.Tensor, B: torch.Tensor, reuse=0) -> int:
     """
-    Assumes that for unstructured, all reuse percentages passed in as a number
-    Assumes that for structured, all reuse percentages passed in as a string
+    Counts the number of FLOPs for batched matrix multiplication A @ B.
+    
+    Parameters:
+        A (torch.Tensor): Tensor of shape (b, m, k)
+        B (torch.Tensor): Tensor of shape (b, k, n)
+    
+    Returns:
+        int: Number of FLOPs (2 * b * m * k * n)
     """
+    if A.dim() != 3 or B.dim() != 3:
+        raise ValueError("Both A and B must be 3D tensors for batched matmul.")
+    if A.shape[0] != B.shape[0] or A.shape[2] != B.shape[1]:
+        raise ValueError(f"Incompatible shapes: {A.shape} and {B.shape} for bmm")
+
+    b, m, k = A.shape
+    _, _, n = B.shape
+    return int(2 * b * m * k * n * (1-reuse))
+
+def get_current_reuse_percentage(reuse_schedule, step):
     applicable = [rp for rp, start in reuse_schedule if step >= start]
     reuse_percentage = applicable[-1] if applicable else 0.0
     if isinstance(reuse_percentage, (int, float)):
@@ -23,10 +60,8 @@ def get_current_reuse_percentage(reuse_schedule, step):
         return num, den, True
     raise ValueError(f"Invalid reuse percentage format: '{reuse_percentage}'")
 
-
 def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structured=False, n=2, group_size=4):
     grad_diff = grad_output - prev_grad_output
-
     if reuse_percentage == 0:
         return grad_diff
 
@@ -35,29 +70,22 @@ def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structu
         last_dim = shape[-1]
         remainder = last_dim % group_size
         pad_needed = (group_size - remainder) if remainder != 0 else 0
-
-        # Pad the last dimension if necessary
         if pad_needed > 0:
             pad_shape = list(shape[:-1]) + [pad_needed]
             pad_tensor = torch.zeros(pad_shape, device=grad_diff.device, dtype=grad_diff.dtype)
             grad_diff = torch.cat([grad_diff, pad_tensor], dim=-1)
 
-        # Reshape into (..., num_groups, group_size)
         new_last_dim = grad_diff.shape[-1]
         num_groups = new_last_dim // group_size
         new_shape = grad_diff.shape[:-1] + (num_groups, group_size)
         grad_diff_grouped = grad_diff.view(*new_shape)
 
-        # Compute top-k mask within each group
         abs_vals = grad_diff_grouped.abs()
         topk = torch.topk(abs_vals, k=n, dim=-1)
-        threshold = topk.values.min(dim=-1, keepdim=True).values  # shape (..., G, 1)
+        threshold = topk.values.min(dim=-1, keepdim=True).values
         reuse_mask = abs_vals >= threshold
 
-        # Apply the mask
         masked_grad = torch.where(reuse_mask, grad_diff_grouped, torch.zeros_like(grad_diff_grouped))
-
-        # Reshape back to original padded shape, then trim off padding
         masked_grad = masked_grad.view(*grad_diff.shape)
         if pad_needed > 0:
             masked_grad = masked_grad[..., :-pad_needed]
@@ -65,7 +93,6 @@ def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structu
         return masked_grad
 
     else:
-        # Unstructured sparsity (elementwise top-k)
         abs_grad_diff = torch.abs(grad_diff)
         flat = abs_grad_diff.flatten()
         threshold_idx = int(flat.size(0) * (1 - reuse_percentage))
@@ -73,20 +100,19 @@ def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structu
         mask = abs_grad_diff > threshold
         return torch.where(mask, grad_diff, torch.tensor(0., device=grad_diff.device))
 
-
 class ReSpropLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, prev_grad_output, reuse_percentage, structured=False, n=2, group_size=4):
+        lin_forward_start = time.time()
         prev_grad_output = prev_grad_output if prev_grad_output is not None else None
-
         if prev_grad_output is not None and len(input.shape) == 3 and prev_grad_output.size(0) == input.size(1):
-            # Precompute prev_grad_input and prev_grad_weight
             prev_grad_input = torch.mm(prev_grad_output, weight)
             prev_grad_weight = torch.mm(prev_grad_output.t(), torch.sum(input, dim=0))
         else:
             if prev_grad_output is not None:
                 print("Warning: Couldn't reuse gradient due to shape mis-match.")
             prev_grad_output = prev_grad_input = prev_grad_weight = None
+        log_time("Linear Pre Compute", lin_forward_start)
 
         ctx.reuse_percentage = reuse_percentage
         ctx.structured = structured
@@ -97,20 +123,20 @@ class ReSpropLinearFunction(torch.autograd.Function):
         output = torch.bmm(input, weight.t().expand(input.size(0), -1, -1))
         if bias is not None:
             output += bias
+        log_time("Linear Forward", lin_forward_start)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
+        back_start = time.time()
         input, weight, bias, prev_grad_output, prev_grad_input, prev_grad_weight = ctx.saved_tensors
-
         grad_input = grad_weight = grad_bias = None
 
-        # Compute reuse mask
         if prev_grad_output is not None:
-            grad_diff = generate_reuse_mask(ctx.reuse_percentage, grad_output, prev_grad_output, ctx.structured, ctx.n, ctx.group_size)
-            grad_output = grad_diff
-        
-        # Compute gradients
+            lin_mask_start = time.time()
+            grad_output = generate_reuse_mask(ctx.reuse_percentage, grad_output, prev_grad_output, ctx.structured, ctx.n, ctx.group_size)
+            log_time("Linear Mask", lin_mask_start)
+        lin_grad_start = time.time()
         if ctx.needs_input_grad[0]:
             grad_input = torch.bmm(grad_output, weight.expand(grad_output.size(0), -1, -1))
             if prev_grad_output is not None:
@@ -120,9 +146,12 @@ class ReSpropLinearFunction(torch.autograd.Function):
             grad_weight = torch.sum(torch.bmm(grad_output.transpose(1, 2), input), dim=0)
             if prev_grad_output is not None:
                 grad_weight += prev_grad_weight
-
         if bias is not None and ctx.needs_input_grad[2]:
             grad_bias = grad_output.sum((0, 1))
+
+        log_time("Linear Grad", lin_grad_start)
+
+        log_time("Linear Backward", back_start)
 
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None
 
@@ -173,7 +202,7 @@ class ReSpropLinear(nn.Linear):
 
     def extra_repr(self):
         return super().extra_repr() + f", reuse_percentage={self.reuse_percentage}"
-        
+    
 class ReSpropAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod, reuse_percentage, structured=False, n=2, group_size=4):
@@ -185,6 +214,7 @@ class ReSpropAttentionFunction(torch.autograd.Function):
         prev_K_prod = dL/dSoftmax_prev * K
         prev_Q_prod = dL/dSoftmax_prev.T * Q
         """
+        attn_forward_start = time.time()
         ctx.reuse_percentage = reuse_percentage
         ctx.structured = structured
         ctx.n = n
@@ -195,42 +225,56 @@ class ReSpropAttentionFunction(torch.autograd.Function):
         attn_scores = torch.bmm(Q, K.transpose(1, 2)) / (d_k ** 0.5)
         attn_probs = torch.softmax(attn_scores, dim=-1)
         ctx.attn_probs = attn_probs  # current softmax
-
+        log_time("Attention Forward", attn_forward_start)
         return torch.bmm(attn_probs, V)
 
     @staticmethod
     def backward(ctx, grad_output):
         Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod = ctx.saved_tensors
+        
         attn_probs = ctx.attn_probs
         d_k = Q.size(-1)
         grad_Q=grad_K=grad_V=None
 
-        if prev_grad_output is not None:
+        att_back_start = time.time()
+        if prev_grad_output is not None and ctx.reuse_percentage > 0:
             grad_diff = generate_reuse_mask(ctx.reuse_percentage, grad_output, prev_grad_output, ctx.structured, ctx.n, ctx.group_size)
+            log_time("Attention masking", att_back_start)
             grad_attn_probs = torch.bmm(grad_diff, V.transpose(1, 2)) + prev_V_prod
             if ctx.needs_input_grad[2]:
                 grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_diff) + prev_attn_prod
         else: 
             grad_attn_probs = torch.bmm(grad_output, V.transpose(1, 2))
+            timer_count['backward_flops'] += count_bmm_flops(grad_output, V.transpose(1, 2))
             if ctx.needs_input_grad[2]:
                 grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_output)
+                timer_count['backward_flops'] += count_bmm_flops(attn_probs.transpose(1, 2), grad_output)
+        log_time("Attention Backward P1", att_back_start)
 
-
+        att_scores = time.time()
         grad_attn_scores = grad_attn_probs * attn_probs
         grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
         grad_attn_scores /= (d_k ** 0.5)
+        log_time("Attention Scores", att_scores)
 
-        if prev_soft_grad is not None:
+        att_back_start_2 = time.time()
+        if prev_soft_grad is not None and ctx.reuse_percentage > 0:
             grad_attn_diff = generate_reuse_mask(ctx.reuse_percentage, grad_attn_scores, prev_soft_grad, ctx.structured, ctx.n, ctx.group_size)
+            log_time("Attention masking 2", att_back_start_2)
             if ctx.needs_input_grad[0]:
                 grad_Q = torch.bmm(grad_attn_diff, K) + prev_K_prod
             if ctx.needs_input_grad[1]:
                 grad_K = torch.bmm(grad_attn_diff.transpose(1, 2), Q) + prev_Q_prod
+            # print('REUSING GRADIENT2')
         else: 
             if ctx.needs_input_grad[0]:
                 grad_Q = torch.bmm(grad_attn_scores, K)
+                timer_count['backward_flops'] += count_bmm_flops(grad_attn_scores, K)
             if ctx.needs_input_grad[1]:
                 grad_K = torch.bmm(grad_attn_scores.transpose(1, 2), Q)
+                timer_count['backward_flops'] += count_bmm_flops(grad_attn_scores.transpose(1, 2), Q)
+        log_time("Attention Backward P2", att_back_start_2)
+        log_time("Attention Backward Total", att_back_start)
 
         return grad_Q, grad_K, grad_V, None, None, None, None, None, None, None, None, None, None
    
@@ -271,6 +315,8 @@ class ReSpropAttention(nn.Module):
         self.prev_K_prods.setdefault(device, None)
         self.prev_Q_prods.setdefault(device, None)
 
+        att_forward_start = time.time()
+
         num1, num2, structured= get_current_reuse_percentage(self.reuse_schedule, self.step_counter[device])
         if not structured:
             reuse_percentage = num1
@@ -298,31 +344,53 @@ class ReSpropAttention(nn.Module):
             n,
             group_size
         )
+        log_time("Attention Forward", att_forward_start)
         if output.requires_grad:
             def hook(grad_output):
                 if self.step_counter[device] % self.k == 0:
                     with torch.no_grad():
-                        rand_idx = torch.randint(0, grad_output.size(0), (1,)).item()
-                        sampled_grad = grad_output[rand_idx:rand_idx+1].detach()
+                        att_hook_start = time.time()
+                        sampled_grad = grad_output.mean(dim=0, keepdim=True).detach()  # [1, T, d]
 
-                        Q_ = Q[rand_idx:rand_idx+1]
-                        K_ = K[rand_idx:rand_idx+1]
-                        V_ = V[rand_idx:rand_idx+1]
+                        Q_ = Q.mean(dim=0, keepdim=True)  # [1, T, d_k]
+                        K_ = K.mean(dim=0, keepdim=True)  # [1, T, d_k]
+                        V_ = V.mean(dim=0, keepdim=True)  # [1, T, d_v]
                         d_k = Q.size(-1)
 
-                        attn_scores = torch.bmm(Q_, K_.transpose(1, 2)) / (d_k ** 0.5)
-                        attn_probs = torch.softmax(attn_scores, dim=-1)
+                        log_time("Attention Hook Averaging", att_hook_start)
 
-                        attn_prod = torch.bmm(attn_probs.transpose(1, 2), sampled_grad)
-                        V_prod = torch.bmm(sampled_grad, V_.transpose(1, 2))
+                        bmm_start = time.time()
 
-                        grad_softmax = torch.bmm(sampled_grad, V_.transpose(1, 2))
-                        grad_attn_scores = grad_softmax * attn_probs
+                        attn_scores = torch.bmm(Q_, K_.transpose(1, 2)) / (d_k ** 0.5)  # [1, T, T]
+                        attn_flops = count_bmm_flops(Q_, K_.transpose(1, 2))
+
+                        attn_probs = torch.softmax(attn_scores, dim=-1)  # [1, T, T]
+
+                        attn_prod = torch.bmm(attn_probs.transpose(1, 2), sampled_grad)  # [1, T, d]
+                        attn_flops += count_bmm_flops(attn_probs.transpose(1, 2), sampled_grad)
+
+                        V_prod = torch.bmm(sampled_grad, V_.transpose(1, 2))  # [1, d, T]
+                        attn_flops += count_bmm_flops(sampled_grad, V_.transpose(1, 2))
+
+                        grad_softmax = torch.bmm(sampled_grad, V_.transpose(1, 2))  # [1, T, T]
+                        attn_flops += count_bmm_flops(sampled_grad, V_.transpose(1, 2))
+
+                        grad_attn_scores = grad_softmax * attn_probs  # [1, T, T]
                         grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
                         grad_attn_scores /= (d_k ** 0.5)
 
-                        K_prod = torch.bmm(grad_attn_scores, K_)
-                        Q_prod = torch.bmm(grad_attn_scores.transpose(1, 2), Q_)
+                        K_prod = torch.bmm(grad_attn_scores, K_)  # [1, T, d]
+                        attn_flops += count_bmm_flops(grad_attn_scores, K_)
+
+                        Q_prod = torch.bmm(grad_attn_scores.transpose(1, 2), Q_)  # [1, T, d]
+                        attn_flops += count_bmm_flops(grad_attn_scores.transpose(1, 2), Q_)
+
+                        # Accumulate total FLOPs
+                        if 'hook_flops' not in timer_count:
+                            timer_count['hook_flops'] = 0
+                        timer_count['hook_flops'] += attn_flops
+
+                        log_time("Attention Hook BMM", bmm_start)
 
                         self.prev_grad_output[device] = sampled_grad
                         self.prev_attn_prods[device] = attn_prod.detach()
@@ -331,6 +399,7 @@ class ReSpropAttention(nn.Module):
                         self.prev_K_prods[device] = K_prod.detach()
                         self.prev_Q_prods[device] = Q_prod.detach()
 
+                        log_time("Attention Hook", att_hook_start)
                 self.step_counter[device] += 1
 
             output.register_hook(hook)
@@ -342,7 +411,7 @@ class ReSpropAttention(nn.Module):
         return f"embed_dim={self.embed_dim}, reuse_percentage={self.reuse_percentage}"
 
 
-def respropify_bert_att_k_old(base_model, att_reuse_schedule=None, lin_reuse_schedule=None, lin_k=1, att_k=1):
+def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedule=None, lin_k=1, att_k=1):
     model = copy.deepcopy(base_model).to(torch.cuda.current_device())
 
     def resprop_attention_block(embed_dim):
@@ -370,7 +439,7 @@ def respropify_bert_att_k_old(base_model, att_reuse_schedule=None, lin_reuse_sch
     return model
 
 
-def patch_bert_self_attention_k_old(model):
+def patch_bert_self_attention_k(model):
     for layer in model.bert.encoder.layer:
         attn_self = layer.attention.self
 
@@ -405,3 +474,7 @@ def patch_bert_self_attention_k_old(model):
                 )
 
         attn_self.forward = types.MethodType(new_forward, attn_self)
+
+def print_times(): 
+    for k, v in timer_count.items():
+        print(f"{k}: {v}")
