@@ -15,11 +15,11 @@ att_schedule = reuse_schedules[0]
 lin_schedule = reuse_schedules[1]
 file_name = "resprop_warmup_both.png"
 batch_size = 128
-num_epochs = 15
+num_epochs = 10
 train_samples = 32000
 test_samples = 128
 output_dir = "outputs_finetune"
-baseline = False
+baseline = True
 plot_name = "resprop_warmup_both.png"
 def get_schedule_string(schedule):
     return ','.join(f'(rp: {x}, start: {y})' for x, y in schedule)
@@ -33,6 +33,7 @@ world_size = torch.cuda.device_count()
 print("Number of GPUs:", torch.cuda.device_count())
 
 if baseline: 
+    print(f"\n==== Running Baseline====\n")
     subprocess.run([
                     "torchrun",
                     f"--master-port={port}",

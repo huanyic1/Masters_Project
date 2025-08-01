@@ -2,7 +2,7 @@
 import os
 import argparse
 from resprop_attention_k import respropify_bert_att_k, patch_bert_self_attention_k, ReSpropAttention, ReSpropLinear
-from resprop_linear import resprofify_bert
+from resprop_linear import respropify_bert
 
 import torch
 from datasets import load_from_disk, concatenate_datasets
@@ -106,7 +106,7 @@ def main():
 
     # model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
     # patch_bert_self_attention_k(model)
-    model = resprofify_bert(base_model, reuse_schedule=scaled_lin_schedule)
+    model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
     if args.resume_path:
         # Get step from trainer state
         trainer_state_file = os.path.join(args.resume_path, "trainer_state.json")
