@@ -2,6 +2,7 @@ import json
 
 import matplotlib.pyplot as plt
 import numpy as np
+import csv
 
 
 def plot_log_histories(log_histories, file_name=None):
@@ -41,6 +42,33 @@ def plot_log_histories(log_histories, file_name=None):
     if file_name:
         plt.savefig(file_name)
     plt.show()
+
+
+
+def export_stats(log_histories, csv_file):
+    """
+    Exports the final training loss and validation accuracy for each run
+    in log_histories to a CSV file.
+    
+    Parameters:
+        log_histories (dict): mapping from reuse_percentage (or label) to list of log entries
+        csv_file (str): path to output CSV file
+    """
+    with open(csv_file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Label", "Final Loss", "Final Eval Accuracy"])
+
+        for label, log_history in log_histories.items():
+            # Filter entries
+            loss_entries = [x["loss"] for x in log_history if "loss" in x]
+            acc_entries = [x["eval_accuracy"] for x in log_history if "eval_accuracy" in x]
+
+            final_loss = loss_entries[-1] if loss_entries else None
+            final_acc = acc_entries[-1] if acc_entries else None
+
+            writer.writerow([label, final_loss, final_acc])
+
+    print(f"Final metrics written to {csv_file}")
 
 
 if __name__ == "__main__":

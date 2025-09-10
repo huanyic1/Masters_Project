@@ -12,7 +12,7 @@ import json
 
 reuse_schedule_path = "reuse_schedule_finetune.json"
 REUSE_SCHEDULES = json.load(open(reuse_schedule_path))
-output_dir = "outputs_finetune"
+# output_dir = "outputs_finetune"
 
 
 def cleanup():
@@ -33,11 +33,15 @@ def main():
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_epochs', type=int, default=5)
     parser.add_argument('--reuse_percentage', type=float)
-    parser.add_argument('--baseline', default=False)
+    parser.add_argument('--baseline', action='store_true')
+    parser.add_argument('--att',  action='store_true')
+    parser.add_argument('--log_name', type=str)
+    parser.add_argument('--output_dir', type=str)
 
     args = parser.parse_args()
     rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = torch.cuda.device_count()
+    output_dir = args.output_dir
 
     device = torch.device(f"cuda:{rank}")
     model_name = args.model_name
@@ -73,15 +77,24 @@ def main():
 
 
     if args.baseline:
+        print("BASELINE IS ON")
         model = base_model
-        save_name = f"{output_dir}/log_history_baseline_seed_{args.seed}.pt"
         output_d = f"trainer_out/{model_name.replace('/', '-')}/baseline_seed_{args.seed}"
-    else: 
+    elif args.att: 
+        print("ATTENTION IS ON")
         model = respropify_bert_att_k(base_model, lin_reuse_schedule=scaled_lin_schedule, att_reuse_schedule=scaled_att_schedule)
         patch_bert_self_attention_k(model)
         output_d = f"trainer_out/{model_name.replace('/', '-')}/rp_att_{att_str}_lin_{lin_str}_seed_{args.seed}"
-        save_name = f"{output_dir}/log_history_att_{att_str}_lin_{lin_str}_seed_{args.seed}_new.pt"
+    else: 
+        print("ATTENTION IS OFF")
+        model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
+        output_d = f"trainer_out/{model_name.replace('/', '-')}/rp_lin_{lin_str}_seed_{args.seed}"
+
+
+    save_name = args.log_name
     model.to(device)
+    model.zero_grad()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
     training_args = TrainingArguments(
         output_dir=output_d,
@@ -108,6 +121,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         compute_metrics=compute_metrics,
+        optimizers=(optimizer, None)
     )
 
     trainer.train()

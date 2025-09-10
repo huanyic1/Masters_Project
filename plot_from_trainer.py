@@ -41,12 +41,17 @@ def plot_loss(history, output_path=None):
     else:
         plt.show()
 
+def plot(input_path, output_path):
+    history = load_log_history(input_path)
+    plot_loss(history, output_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Plot train/eval loss from a HuggingFace trainer_state.json"
     )
     parser.add_argument(
-        "trainer_state",
+        "--trainer_state",
         type=Path,
         help="Path to trainer_state.json (in your output_dir)"
     )

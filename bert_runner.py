@@ -3,7 +3,7 @@ import os
 import argparse
 from resprop_attention_k import respropify_bert_att_k, patch_bert_self_attention_k, ReSpropAttention, ReSpropLinear
 from resprop_linear import respropify_bert
-
+from plot_from_trainer import plot_loss
 import torch
 from datasets import load_from_disk, concatenate_datasets
 from transformers import (
@@ -58,6 +58,7 @@ def parse_args():
         default=0.15,
         help="Masking probability for MLM",
     )
+
     p.add_argument(
         "--num_proc",
         type=int,
@@ -76,14 +77,18 @@ def main():
     owt  = load_from_disk(os.path.join(args.cache_dir, "openwebtext-None-train"))
     train_ds = concatenate_datasets([wiki, owt])
 
+    train_ds = train_ds.select(range(100000))
+
     # 2) tokenizer & model
     tokenizer = AutoTokenizer.from_pretrained(args.token_path, use_fast=True)
 
 
-    att_schedule = [[0, 0], ["2:4", 0.2]]
-    lin_schedule = [[0, 0], ["2:4", 0.2]]
+    att_schedule = [[0, 0], [0.99, 0.2]]
+    lin_schedule = [[0, 0], [0.99, 0.2]]
     num_epochs = args.epochs
     batch_size = args.batch_size
+
+
     num_iters = (len(train_ds) // args.num_proc) * num_epochs // batch_size
 
     scaled_lin_schedule = [(x, y * num_iters) for x, y in lin_schedule]
@@ -103,9 +108,9 @@ def main():
         base_model = BertForMaskedLM(config)
     else:
         base_model = BertForMaskedLM.from_pretrained(args.resume_path)
-
-    # model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
-    # patch_bert_self_attention_k(model)
+    # model = base_model
+    model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
+    patch_bert_self_attention_k(model)
     model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
     if args.resume_path:
         # Get step from trainer state
@@ -143,7 +148,7 @@ def main():
         fp16=False,
         save_total_limit=3,
         save_steps=10_000,
-        logging_steps=500,
+        logging_steps=100,
         dataloader_num_workers=args.num_proc,
         gradient_accumulation_steps=1,
         evaluation_strategy="no",
@@ -165,6 +170,9 @@ def main():
     trainer.save_model(args.output_dir)
     if local_rank in (-1, 0):
         print(f"✅ Training complete. Model saved to {args.output_dir}")
+
+    history = trainer.state.log_history
+    plot_loss(history, 'small_unstructured.png')
 
 if __name__ == "__main__":
     main()

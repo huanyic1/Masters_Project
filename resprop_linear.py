@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import copy
+import math
 
 
 def get_current_reuse_percentage(reuse_schedule, step): 
@@ -29,52 +30,44 @@ def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structu
         return grad_diff
 
     if structured:
-        shape = grad_diff.shape
-        last_dim = shape[-1]
-        remainder = last_dim % group_size
-        pad_needed = (group_size - remainder) if remainder != 0 else 0
+        pad = (group_size - grad_diff.shape[-1] % group_size) % group_size
+        if pad:
+            grad_diff = torch.nn.functional.pad(grad_diff, (0, pad))
 
-        # Pad the last dimension if necessary
-        if pad_needed > 0:
-            pad_shape = list(shape[:-1]) + [pad_needed]
-            pad_tensor = torch.zeros(pad_shape, device=grad_diff.device, dtype=grad_diff.dtype)
-            grad_diff = torch.cat([grad_diff, pad_tensor], dim=-1)
+        G = grad_diff.shape[-1] // group_size
+        x = grad_diff.view(*grad_diff.shape[:-1], G, group_size)
+        ax = x.abs()
 
-        # Reshape into (..., num_groups, group_size)
-        new_last_dim = grad_diff.shape[-1]
-        num_groups = new_last_dim // group_size
-        new_shape = grad_diff.shape[:-1] + (num_groups, group_size)
-        grad_diff_grouped = grad_diff.view(*new_shape)
+        # nth largest == kth smallest of (-abs) with k=n
+        kth_neg, _ = (-ax).kthvalue(k=n, dim=-1, keepdim=True)   # (..., G, 1)
+        thresh = -kth_neg                                         # (..., G, 1)
 
-        # Compute top-k mask within each group
-        abs_vals = grad_diff_grouped.abs()
-        topk = torch.topk(abs_vals, k=n, dim=-1)
-        threshold = topk.values.min(dim=-1, keepdim=True).values  # shape (..., G, 1)
-        reuse_mask = abs_vals >= threshold
+        # mask in-place without allocating zeros_like
+        out = x.clone()
+        out.masked_fill_(ax < thresh, 0)
 
-        # Apply the mask
-        masked_grad = torch.where(reuse_mask, grad_diff_grouped, torch.zeros_like(grad_diff_grouped))
-
-        # Reshape back to original padded shape, then trim off padding
-        masked_grad = masked_grad.view(*grad_diff.shape)
-        if pad_needed > 0:
-            masked_grad = masked_grad[..., :-pad_needed]
-
-        return masked_grad
-
+        out = out.view(*grad_diff.shape)
+        if pad:
+            out = out[..., :-pad]
+        return out
     else:
-        # Unstructured sparsity (elementwise top-k)
-        abs_grad_diff = torch.abs(grad_diff)
-        flat = abs_grad_diff.flatten()
-        threshold_idx = int(flat.size(0) * (1 - reuse_percentage))
-        threshold = torch.topk(flat, threshold_idx, largest=True).values[-1]
-        mask = abs_grad_diff > threshold
-        return torch.where(mask, grad_diff, torch.tensor(0., device=grad_diff.device))
+        N = grad_diff.numel()
+        k_keep = int(max(0, math.floor(reuse_percentage * N)))
+        if k_keep <= 0:
+            return torch.zeros_like(grad_diff)
+        if k_keep >= N:
+            return grad_diff
+
+        abs_flat = grad_diff.abs().view(-1)
+        vals, idx = torch.topk(abs_flat, k_keep, largest=True, sorted=False)
+        out = torch.zeros_like(grad_diff).view(-1)
+        out.scatter_(0, idx, grad_diff.view(-1).index_select(0, idx))
+        return out.view_as(grad_diff)
 
 class ReSpropLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, prev_grad_output, reuse_percentage, structured=False, n=2, group_size=4):
-        if prev_grad_output is not None and \
+        if prev_grad_output is not None and reuse_percentage > 0 and \
                 len(input.shape) == 3 and prev_grad_output.size(0) == input.size(1):
             prev_grad_input = torch.mm(prev_grad_output, weight)                        # pre∇w_l
             prev_grad_weight = torch.mm(prev_grad_output.t(), torch.sum(input, dim=0))  # pre∇a_l
@@ -138,12 +131,14 @@ class ReSpropLinear(nn.Linear):
             bias: bool = True,
             device=None,
             dtype=None,
-            reuse_schedule: list = [(0.9, 0)]
+            reuse_schedule: list = [(0.9, 0)], 
+            avg: bool = True
     ):
         super().__init__(in_features, out_features, bias, device, dtype)
         self.prev_gradients = None
         self.reuse_schedule = reuse_schedule
         self.step_counter = {}
+        self.avg = avg
 
     def forward(self, input):
         device = input.device
@@ -163,10 +158,11 @@ class ReSpropLinear(nn.Linear):
 
         if output.requires_grad:
             def hook(grad_output):
-                # Store gradients for next iteration
-                self.prev_gradients = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
-                return None
-
+                if reuse_percentage > 0 and self.step_counter[device] % self.k == 0:
+                    if self.avg:
+                        self.prev_gradients[device] = grad_output.sum(dim=0) / grad_output.size(0) #torch.mean(grad_output, dim=0) # 
+                    else: 
+                        self.prev_gradients[device] = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
             output.register_hook(hook)
         else:
             self.prev_gradients = None
@@ -179,12 +175,20 @@ class ReSpropLinear(nn.Linear):
 
 def respropify_bert(base_model, reuse_schedule=[(0.9, 0)]):
     def resprop_linear(layer: nn.Linear):
-        return ReSpropLinear(
+        new_layer = ReSpropLinear(
             layer.in_features,
             layer.out_features,
             layer.bias is not None,
             reuse_schedule=reuse_schedule
         )
+        new_layer.weight.data.copy_(layer.weight.data)
+        if layer.weight.grad is not None:
+            new_layer.weight.grad.data.copy_(layer.weight.grad.data)
+        if layer.bias is not None:
+            new_layer.bias.data.copy_(layer.bias.data)
+            if layer.bias.grad is not None:
+                new_layer.bias.grad.data.copy_(layer.bias.grad.data)
+        return new_layer
 
     model = copy.deepcopy(base_model).to(torch.cuda.current_device())
     for layer in model.bert.encoder.layer:
