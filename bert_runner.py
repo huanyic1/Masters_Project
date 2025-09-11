@@ -65,26 +65,33 @@ def parse_args():
         default=4,
         help="Number of workers for DataLoader / map",
     )
+    p.add_argument('--max_training_samples', type=int, default=None)
     p.add_argument("--resume_path", type=str, default=None)
     p.add_argument("--resume_step", type=int, default=0)
+    p.add_argument('--plot_name', type=str, default='trial.png')
+    p.add_argument('--baseline',  action='store_true')
     return p.parse_args()
 
 def main():
     args = parse_args()
 
     # 1) load cached datasets & concatenate
-    wiki = load_from_disk(os.path.join(args.cache_dir, "wikipedia-20220301.en-train"))
-    owt  = load_from_disk(os.path.join(args.cache_dir, "openwebtext-None-train"))
-    train_ds = concatenate_datasets([wiki, owt])
+    # wiki = load_from_disk(os.path.join(args.cache_dir, "wikipedia-20220301.en-train"))
+    # owt  = load_from_disk(os.path.join(args.cache_dir, "openwebtext-None-train"))
+    # train_ds = concatenate_datasets([wiki, owt])
+    train_ds_dict =  load_from_disk(os.path.join(args.cache_dir, "wiki_owt_block128"))
 
-    train_ds = train_ds.select(range(100000))
+    train_ds = train_ds_dict['train']
+    if args.max_training_samples is not None:
+        max_samples = min(len(train_ds), args.max_training_samples)
+        train_ds = train_ds.select(range(max_samples))
 
     # 2) tokenizer & model
     tokenizer = AutoTokenizer.from_pretrained(args.token_path, use_fast=True)
 
 
-    att_schedule = [[0, 0], [0.99, 0.2]]
-    lin_schedule = [[0, 0], [0.99, 0.2]]
+    att_schedule = [[0.0, 0.0]]
+    lin_schedule = [[0.0, 0.0]]
     num_epochs = args.epochs
     batch_size = args.batch_size
 
@@ -106,12 +113,19 @@ def main():
             pad_token_id=tokenizer.pad_token_id,
         )
         base_model = BertForMaskedLM(config)
+        print("generating raw model")
     else:
         base_model = BertForMaskedLM.from_pretrained(args.resume_path)
-    # model = base_model
-    model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
-    patch_bert_self_attention_k(model)
-    model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
+
+    if args.baseline:
+        model = base_model
+        print("Baseline Model")
+    else: 
+        print("Sharting the Model")
+        model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
+        patch_bert_self_attention_k(model)
+
+    # model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
     if args.resume_path:
         # Get step from trainer state
         trainer_state_file = os.path.join(args.resume_path, "trainer_state.json")
@@ -148,7 +162,7 @@ def main():
         fp16=False,
         save_total_limit=3,
         save_steps=10_000,
-        logging_steps=100,
+        logging_steps=500,
         dataloader_num_workers=args.num_proc,
         gradient_accumulation_steps=1,
         evaluation_strategy="no",
@@ -172,7 +186,7 @@ def main():
         print(f"✅ Training complete. Model saved to {args.output_dir}")
 
     history = trainer.state.log_history
-    plot_loss(history, 'small_unstructured.png')
+    plot_loss(history, args.plot_name)
 
 if __name__ == "__main__":
     main()

@@ -9,8 +9,8 @@ lin_k_s = [1]
 att_k_s = [1]
 seed = 42
 reuse_schedule_path = "reuse_schedule_finetune.json"
-# model_name = "prajjwal1/bert-tiny" 
-model_name = 'bert-base-uncased'
+model_name = "prajjwal1/bert-tiny" 
+# model_name = 'bert-base-uncased'
 reuse_schedules = json.load(open(reuse_schedule_path))
 att_schedule = reuse_schedules[0]
 lin_schedule = reuse_schedules[1]
@@ -72,25 +72,25 @@ for idx in range(len(att_schedule)):
         key = f"lin_{lin_str}" 
     key = keys[idx]
     print(f"\n==== Running att schedule {att_str} lin schedule {lin_str}====\n")
-    # args = [
-    #         "torchrun",
-    #         f"--master-port={port}",
-    #         f"--nproc-per-node={world_size}",
-    #         "finetune_script.py",
-    #         f"--reuse_schedule_idx={idx}",
-    #         f"--seed={seed}",
-    #         f"--model_name={model_name}",
-    #         f"--num_train={train_samples}",
-    #         f"--num_test={test_samples}",
-    #         f"--batch_size={batch_size}",
-    #         f"--num_epochs={num_epochs}", 
-    #         f"--log_name={log_name}",
-    #         f"--output_dir={output_dir}"
-    #     ]
-    # if att:
-    #     args.append("--att")
+    args = [
+            "torchrun",
+            f"--master-port={port}",
+            f"--nproc-per-node={world_size}",
+            "finetune_script.py",
+            f"--reuse_schedule_idx={idx}",
+            f"--seed={seed}",
+            f"--model_name={model_name}",
+            f"--num_train={train_samples}",
+            f"--num_test={test_samples}",
+            f"--batch_size={batch_size}",
+            f"--num_epochs={num_epochs}", 
+            f"--log_name={log_name}",
+            f"--output_dir={output_dir}"
+        ]
+    if att:
+        args.append("--att")
 
-    # subprocess.run(args, check=True)
+    subprocess.run(args, check=True)
     log_histories[key] = torch.load(log_name)
 # 📈 Plot all histories
 plot_log_histories(log_histories, file_name=plot_name)
