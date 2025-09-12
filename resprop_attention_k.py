@@ -6,6 +6,8 @@ import math
 import types
 
 import torch.nn.functional as F
+
+
 def compare_parameters(param1, param2, name=""):
     cos_sim = F.cosine_similarity(param1.view(-1), param2.view(-1), dim=0).item()
     max_diff = (param1 - param2).abs().max().item()
@@ -260,8 +262,12 @@ class ReSpropAttentionFunction(torch.autograd.Function):
                 # grad_V = torch.matmul(attn_probs.transpose(1, 2), grad_output)
                 grad_V = torch.einsum('btu,btv->buv', attn_probs, grad_output)
 
-        grad_attn_scores = torch.einsum('btu, btu -> bt', grad_attn_probs, attn_probs)
-        grad_attn_scores = (grad_attn_probs - attn_probs * grad_attn_scores.unsqueeze(-1)) * attn_probs
+        #grad_attn_scores = torch.einsum('btu, btu -> bt', grad_attn_probs, attn_probs)
+        #grad_attn_scores = (grad_attn_probs - attn_probs * grad_attn_scores.unsqueeze(-1)) * attn_probs
+        #grad_attn_scores = grad_attn_scores * (d_k ** -0.5)
+        # Rowwise dot: sum over last dim
+        row_dot = (grad_attn_probs * attn_probs).sum(dim=-1, keepdim=True)  # [B, T, 1]
+        grad_attn_scores = (grad_attn_probs - row_dot) * attn_probs         # [B, T, T]
         grad_attn_scores = grad_attn_scores * (d_k ** -0.5)
 
 
@@ -279,7 +285,7 @@ class ReSpropAttentionFunction(torch.autograd.Function):
                 # grad_K = torch.bmm(grad_attn_diff.transpose(1, 2), Q) + prev_Q_prod
                 # grad_K = torch.matmul(grad_attn_diff.transpose(1, 2), Q) + prev_Q_prod
                 grad_K = torch.einsum('btu, btd -> bud', grad_attn_diff, Q) + prev_Q_prod
-        else: 
+        else:
             if ctx.needs_input_grad[0]:
                 # grad_Q = torch.bmm(grad_attn_scores, K)
                 # grad_Q = torch.matmul(grad_attn_scores, K)
