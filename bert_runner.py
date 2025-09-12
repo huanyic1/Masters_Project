@@ -90,8 +90,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.token_path, use_fast=True)
 
 
-    att_schedule = [[0.0, 0.0]]
-    lin_schedule = [[0.0, 0.0]]
+    att_schedule = [[0.0, 0.0], ["2:4", 0.35]]
+    lin_schedule = [[0.0, 0.0], ["2:4", 0.35]]
     num_epochs = args.epochs
     batch_size = args.batch_size
 
@@ -124,8 +124,7 @@ def main():
         print("Sharting the Model")
         model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
         patch_bert_self_attention_k(model)
-
-    # model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
+        #model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
     if args.resume_path:
         # Get step from trainer state
         trainer_state_file = os.path.join(args.resume_path, "trainer_state.json")
@@ -161,8 +160,8 @@ def main():
         learning_rate=args.learning_rate,
         fp16=False,
         save_total_limit=3,
-        save_steps=10_000,
-        logging_steps=500,
+        save_steps=1000,
+        logging_steps=100,
         dataloader_num_workers=args.num_proc,
         gradient_accumulation_steps=1,
         evaluation_strategy="no",
