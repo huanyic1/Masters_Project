@@ -65,7 +65,7 @@ def parse_args():
         default=4,
         help="Number of workers for DataLoader / map",
     )
-    p.add_argument('--max_training_samples', type=int, default=None)
+    p.add_argument('--max_steps', type=int, default=1000000)
     p.add_argument("--resume_path", type=str, default=None)
     p.add_argument("--resume_step", type=int, default=0)
     p.add_argument('--plot_name', type=str, default='trial.png')
@@ -76,15 +76,16 @@ def main():
     args = parse_args()
 
     # 1) load cached datasets & concatenate
-    # wiki = load_from_disk(os.path.join(args.cache_dir, "wikipedia-20220301.en-train"))
-    # owt  = load_from_disk(os.path.join(args.cache_dir, "openwebtext-None-train"))
-    # train_ds = concatenate_datasets([wiki, owt])
-    train_ds_dict =  load_from_disk(os.path.join(args.cache_dir, "wiki_owt_block128"))
+    wiki = load_from_disk("./cached/wikipedia-20220301.en-train")
+    owt  = load_from_disk("./cached/openwebtext-None-train")
+    train_ds = concatenate_datasets([wiki, owt])
 
-    train_ds = train_ds_dict['train']
-    if args.max_training_samples is not None:
-        max_samples = min(len(train_ds), args.max_training_samples)
-        train_ds = train_ds.select(range(max_samples))
+    # train_ds_dict =  load_from_disk(os.path.join(args.cache_dir, "wiki_owt_block128"))
+    # train_ds = train_ds_dict['train']
+
+    # if args.max_training_samples is not None:
+    #     max_samples = min(len(train_ds), args.max_training_samples)
+    #     train_ds = train_ds.select(range(max_samples))
 
     # 2) tokenizer & model
     tokenizer = AutoTokenizer.from_pretrained(args.token_path, use_fast=True)
@@ -103,14 +104,18 @@ def main():
 
     if not args.resume_path:
         config = BertConfig(
-            vocab_size=tokenizer.vocab_size,
-            hidden_size=768,
-            num_hidden_layers=12,
-            num_attention_heads=12,
-            intermediate_size=3072,
-            max_position_embeddings=128,
-            type_vocab_size=2,
-            pad_token_id=tokenizer.pad_token_id,
+            vocab_size=30522,             # WordPiece vocab size
+            hidden_size=768,              # Transformer hidden dimension
+            num_hidden_layers=12,         # Number of Transformer blocks
+            num_attention_heads=12,       # Heads per self-attention
+            intermediate_size=3072,       # Feed-forward hidden dimension
+            hidden_act="gelu",            # Activation function
+            hidden_dropout_prob=0.1,      # Dropout on hidden layers
+            attention_probs_dropout_prob=0.1,  # Dropout on attention weights
+            max_position_embeddings=512,  # Maximum sequence length
+            type_vocab_size=2,            # For segment embeddings (NSP)
+            initializer_range=0.02,       # Weight init std
+            layer_norm_eps=1e-12,         # Epsilon inside LayerNorm
         )
         base_model = BertForMaskedLM(config)
         print("generating raw model")
@@ -153,11 +158,25 @@ def main():
     # 4) TrainingArguments picks up LOCAL_RANK from torchrun automatically
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     training_args = TrainingArguments(
+        max_steps=args.max_steps,           # fixed budget of 1M steps
+        num_train_epochs=1,  
+
         output_dir=args.output_dir,
+        learning_rate=1e-4,
+        weight_decay=0.01,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_epsilon=1e-6,
+        max_grad_norm=1.0,
+
+        # === Scheduler ===
+        warmup_ratio=0.1,              # 10% warmup
+        lr_scheduler_type="linear",
+
         overwrite_output_dir=False,
-        num_train_epochs=args.epochs,
+        # num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
+
         fp16=False,
         save_total_limit=3,
         save_steps=1000,
