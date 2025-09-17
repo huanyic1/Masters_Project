@@ -153,7 +153,7 @@ class ReSpropLinear(nn.Linear):
             n = None
             group_size = None
         else:
-            reuse_percentage = None
+            reuse_percentage = num1/num2
             n = num1
             group_size = num2
 

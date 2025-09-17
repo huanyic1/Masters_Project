@@ -120,7 +120,6 @@ class ReSpropLinearFunction(torch.autograd.Function):
         if prev_grad_output is not None:
             grad_diff = generate_reuse_mask(ctx.reuse_percentage, grad_output, prev_grad_output, ctx.structured, ctx.n, ctx.group_size)
             grad_output = grad_diff
-            print(grad_diff)
         
         # Compute gradients
         if ctx.needs_input_grad[0]:
@@ -427,9 +426,15 @@ class ReSpropAttention(nn.Module):
                         # G = dL/dA = sampled_grad @ V^T → [1, T, T]
                         V_prod = torch.einsum('btd,bdu->btu', sampled_grad, V_.transpose(1, 2))
 
-                        # softmax backward to scores: grad_scores = (G - A * sum(G*A)) * A / sqrt(d_k)
-                        s = torch.einsum('btu,btu->bt', V_prod, attn_probs).unsqueeze(-1)    # [1, T, 1]
-                        grad_attn_scores = (V_prod - attn_probs * s) * attn_probs * inv_sqrt_dk  # [1, T, T]
+                        # # softmax backward to scores: grad_scores = (G - A * sum(G*A)) * A / sqrt(d_k)
+                        # s = torch.einsum('btu,btu->bt', V_prod, attn_probs).unsqueeze(-1)    # [1, T, 1]
+                        # grad_attn_scores = (V_prod - attn_probs * s) * attn_probs * inv_sqrt_dk  # [1, T, T]
+
+                        grad_attn_probs = torch.einsum('btv, buv -> btu', sampled_grad, V_)
+                        row_dot = (grad_attn_probs * attn_probs).sum(dim=-1, keepdim=True)  
+                        grad_attn_scores = (grad_attn_probs - row_dot) * attn_probs    
+                        grad_attn_scores = grad_attn_scores * inv_sqrt_dk
+
 
                         # K/Q products for reuse
                         K_prod = torch.einsum('btu,bud->btd', grad_attn_scores, K_)        # [1, T, d_k]
