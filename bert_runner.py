@@ -17,6 +17,9 @@ from transformers import (
 )
 import json
 
+def gen_label(lin_schedule, att_schedule): 
+    return f"Linear Schedule: {lin_schedule} \n Attention Schedule: {att_schedule}"
+
 def parse_args():
     p = argparse.ArgumentParser(description="Resume BERT pre-training with torchrun + DDP")
     p.add_argument(
@@ -70,18 +73,19 @@ def parse_args():
     p.add_argument("--resume_step", type=int, default=0)
     p.add_argument('--plot_name', type=str, default='trial.png')
     p.add_argument('--baseline',  action='store_true')
+    p.add_argument('--num_accum', type=int, default=1)
     return p.parse_args()
 
 def main():
     args = parse_args()
 
     # 1) load cached datasets & concatenate
-    wiki = load_from_disk("./cached/wikipedia-20220301.en-train")
-    owt  = load_from_disk("./cached/openwebtext-None-train")
-    train_ds = concatenate_datasets([wiki, owt])
+    #wiki = load_from_disk("./cached/wikipedia-20220301.en-train")
+    #owt  = load_from_disk("./cached/openwebtext-None-train")
+    #train_ds = concatenate_datasets([wiki, owt])
 
-    # train_ds_dict =  load_from_disk(os.path.join(args.cache_dir, "wiki_owt_block128"))
-    # train_ds = train_ds_dict['train']
+    train_ds_dict =  load_from_disk(os.path.join(args.cache_dir, "wiki_owt_block128"))
+    train_ds = train_ds_dict['train']
 
     # if args.max_training_samples is not None:
     #     max_samples = min(len(train_ds), args.max_training_samples)
@@ -91,14 +95,14 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.token_path, use_fast=True)
 
 
-    att_schedule = [[0.0, 0.0], ["2:4", 0.35]]
-    lin_schedule = [[0.0, 0.0], ["2:4", 0.35]]
+    att_schedule = [[0, 0.0]]
+    lin_schedule = [[0.7, 0.0]]
     num_epochs = args.epochs
     batch_size = args.batch_size
 
 
-    num_iters = (len(train_ds) // args.num_proc) * num_epochs // batch_size
-
+    #num_iters = (len(train_ds) // args.num_proc) * num_epochs // batch_size
+    num_iters = args.max_steps
     scaled_lin_schedule = [(x, y * num_iters) for x, y in lin_schedule]
     scaled_att_schedule = [(x, y * num_iters) for x, y in att_schedule]
 
@@ -127,9 +131,9 @@ def main():
         print("Baseline Model")
     else: 
         print("Sharting the Model")
-        model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
-        patch_bert_self_attention_k(model)
-        #model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
+        # model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
+        # patch_bert_self_attention_k(model)
+        model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
     if args.resume_path:
         # Get step from trainer state
         trainer_state_file = os.path.join(args.resume_path, "trainer_state.json")
@@ -176,13 +180,13 @@ def main():
         overwrite_output_dir=False,
         # num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.num_accum, 
 
         fp16=False,
         save_total_limit=3,
-        save_steps=1000,
+        save_steps=200,
         logging_steps=100,
         dataloader_num_workers=args.num_proc,
-        gradient_accumulation_steps=1,
         evaluation_strategy="no",
         local_rank=local_rank,
     )
@@ -196,15 +200,22 @@ def main():
     )
 
     # 6) resume training
-    trainer.train(resume_from_checkpoint=args.resume_path)
+    if args.resume_path is not None:
+        trainer.train(resume_from_checkpoint=args.resume_path)
+    else: 
+        trainer.train()
 
     # 7) final save
     trainer.save_model(args.output_dir)
     if local_rank in (-1, 0):
         print(f"✅ Training complete. Model saved to {args.output_dir}")
 
+    label = gen_label(scaled_lin_schedule, scaled_att_schedule)
+    if args.baseline: 
+        label = 'baseline'
+
     history = trainer.state.log_history
-    plot_loss(history, args.plot_name)
+    plot_loss(history, args.plot_name, label)
 
 if __name__ == "__main__":
     main()

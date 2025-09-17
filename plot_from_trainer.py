@@ -15,7 +15,7 @@ def load_log_history(trainer_state_path):
         raise ValueError(f"No log_history found in {trainer_state_path}")
     return history
 
-def plot_loss(history, output_path=None):
+def plot_loss(history, output_path=None, label='Baseline'):
     # extract train-loss entries
     train = [(e["step"], e["loss"]) for e in history if "loss" in e]
     steps_tr, loss_tr = zip(*train) if train else ([], [])
@@ -31,7 +31,7 @@ def plot_loss(history, output_path=None):
         plt.plot(steps_ev, loss_ev, label="eval loss")
     plt.xlabel("Step")
     plt.ylabel("Loss")
-    plt.title("Training & Evaluation Loss")
+    plt.title("Training & Evaluation Loss for " + label)
     plt.legend()
     plt.grid(True)
 

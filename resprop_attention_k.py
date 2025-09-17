@@ -63,16 +63,18 @@ def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structu
         return out
     else:
         N = grad_diff.numel()
-        k_keep = int(max(0, math.floor(reuse_percentage * N)))
+        k_keep = int(max(0, math.floor((1-reuse_percentage) * N)))
         if k_keep <= 0:
             return torch.zeros_like(grad_diff)
         if k_keep >= N:
             return grad_diff
 
-        abs_flat = grad_diff.abs().view(-1)
+        abs_flat = grad_diff.abs().reshape(-1)
         vals, idx = torch.topk(abs_flat, k_keep, largest=True, sorted=False)
-        out = torch.zeros_like(grad_diff).view(-1)
-        out.scatter_(0, idx, grad_diff.view(-1).index_select(0, idx))
+
+        out = torch.zeros_like(grad_diff).reshape(-1)
+        out.scatter_(0, idx, grad_diff.reshape(-1).index_select(0, idx))
+
         return out.view_as(grad_diff)
 
 
@@ -118,6 +120,7 @@ class ReSpropLinearFunction(torch.autograd.Function):
         if prev_grad_output is not None:
             grad_diff = generate_reuse_mask(ctx.reuse_percentage, grad_output, prev_grad_output, ctx.structured, ctx.n, ctx.group_size)
             grad_output = grad_diff
+            print(grad_diff)
         
         # Compute gradients
         if ctx.needs_input_grad[0]:
@@ -176,7 +179,7 @@ class ReSpropLinear(nn.Linear):
 
         if output.requires_grad:
             def hook(grad_output):
-                if reuse_percentage > 0 and self.step_counter[device] % self.k == 0:
+                if reuse_percentage > 0: #and self.step_counter[device] % self.k == 0:
                     if self.avg:
                         self.prev_gradients[device] =  grad_output.sum(dim=0) / grad_output.size(0) # torch.mean(grad_output, dim=0) #
                     else: 
@@ -516,3 +519,10 @@ def patch_bert_self_attention_k(model):
                 )
 
         attn_self.forward = types.MethodType(new_forward, attn_self)
+
+
+def main(): 
+    pass
+
+if __name__ == "__main__":
+    main()

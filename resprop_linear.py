@@ -52,16 +52,18 @@ def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structu
         return out
     else:
         N = grad_diff.numel()
-        k_keep = int(max(0, math.floor(reuse_percentage * N)))
+        k_keep = int(max(0, math.floor((1-reuse_percentage) * N)))
         if k_keep <= 0:
             return torch.zeros_like(grad_diff)
         if k_keep >= N:
             return grad_diff
 
-        abs_flat = grad_diff.abs().view(-1)
+        abs_flat = grad_diff.abs().reshape(-1)
         vals, idx = torch.topk(abs_flat, k_keep, largest=True, sorted=False)
-        out = torch.zeros_like(grad_diff).view(-1)
-        out.scatter_(0, idx, grad_diff.view(-1).index_select(0, idx))
+
+        out = torch.zeros_like(grad_diff).reshape(-1)
+        out.scatter_(0, idx, grad_diff.reshape(-1).index_select(0, idx))
+
         return out.view_as(grad_diff)
 
 class ReSpropLinearFunction(torch.autograd.Function):
@@ -135,7 +137,7 @@ class ReSpropLinear(nn.Linear):
             avg: bool = True
     ):
         super().__init__(in_features, out_features, bias, device, dtype)
-        self.prev_gradients = None
+        self.prev_gradients = {}
         self.reuse_schedule = reuse_schedule
         self.step_counter = {}
         self.avg = avg
@@ -143,6 +145,7 @@ class ReSpropLinear(nn.Linear):
     def forward(self, input):
         device = input.device
         self.step_counter.setdefault(device, 0)
+        self.prev_gradients.setdefault(device, None)
         step = self.step_counter[device]
         num1, num2, structured = get_current_reuse_percentage(self.reuse_schedule, step)
         if not structured:
@@ -154,18 +157,18 @@ class ReSpropLinear(nn.Linear):
             n = num1
             group_size = num2
 
-        output = ReSpropLinearFunction.apply(input, self.weight, self.bias, self.prev_gradients, reuse_percentage, structured, n, group_size)
+        output = ReSpropLinearFunction.apply(input, self.weight, self.bias, self.prev_gradients[device], reuse_percentage, structured, n, group_size)
 
         if output.requires_grad:
             def hook(grad_output):
-                if reuse_percentage > 0 and self.step_counter[device] % self.k == 0:
+                if reuse_percentage > 0: #and self.step_counter[device] % self.k == 0:
                     if self.avg:
                         self.prev_gradients[device] = grad_output.sum(dim=0) / grad_output.size(0) #torch.mean(grad_output, dim=0) # 
                     else: 
                         self.prev_gradients[device] = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
             output.register_hook(hook)
         else:
-            self.prev_gradients = None
+            self.prev_gradients[device] = None
 
         return output
 
