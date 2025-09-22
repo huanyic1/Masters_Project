@@ -53,5 +53,5 @@ _size 32 --num_accum 2  --epochs 3  --mlm_probability 0.15   --num_proc 4 --max_
 
 
 Depending on the reuse schedule specified in bert_runner.py, this can take anywhere from 18-24 hours for 100000 samples,
-at the end of which a file called f`{plot_name}.png` should be generated,
+at the end of which a file called `{plot_name}.png` should be generated,
 showing training loss. 
