@@ -23,6 +23,7 @@ model = respropify_bert_att_k(model, att_reuse_schedule=[[0.0,0],[0.9, 0.25]], l
 > The provided implementation at the moment only serves to demonstrate that one can reuse gradients during training, without taking advantage of the sparsity.
 > Consequently, backpropagation is actually slower when using it.
 
+Specifying reuse percentage as a float will result in unstructured sparsity; specifying it with a string in the form of "n:m" will result in structured sparsity. 
 
 ## Run Experiments
 We recommend you use [pixi](http://pixi.sh) to set up the environment and run the experiment.
