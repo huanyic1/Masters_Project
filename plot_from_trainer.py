@@ -41,6 +41,55 @@ def plot_loss(history, output_path=None, label='Baseline'):
     else:
         plt.show()
 
+
+
+def plot_training_losses(config_json, save_path=None):
+    """
+    Read a CSV of trainer_state.json paths and labels, 
+    plot all training losses on the same figure.
+    
+    CSV format: path,label
+    """
+    plt.figure(figsize=(10, 6))
+
+    with open(config_json, "r") as f:
+        configs = json.load(f)
+
+    for entry in configs:
+        path = Path(entry["path"]).expanduser()
+        label = entry.get("label", str(path))
+
+        if not path.exists():
+            print(f"⚠️ Skipping missing file: {path}")
+            continue
+
+        with open(path, "r") as jf:
+            state = json.load(jf)
+
+        logs = state.get("log_history", [])
+        steps, losses = [], []
+        for log in logs:
+            if "loss" in log:
+                steps.append(log["step"])
+                losses.append(log["loss"])
+
+        if steps:
+            plt.plot(steps, losses, label=label)
+        else:
+            print(f"⚠️ No training losses found in {path}")
+
+    plt.xlabel("Step")
+    plt.ylabel("Training Loss")
+    plt.title("Training Loss Comparison")
+    plt.legend()
+    plt.grid(True)
+
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+        print(f"Saved plot to {save_path}")
+    else:
+        plt.show()
+
 def plot(input_path, output_path):
     history = load_log_history(input_path)
     plot_loss(history, output_path)
@@ -51,9 +100,9 @@ def main():
         description="Plot train/eval loss from a HuggingFace trainer_state.json"
     )
     parser.add_argument(
-        "--trainer_state",
+        "--config_json",
         type=Path,
-        help="Path to trainer_state.json (in your output_dir)"
+        help="Path to loss_paths.json (in your output_dir)"
     )
     parser.add_argument(
         "-o", "--output",
@@ -62,8 +111,9 @@ def main():
     )
     args = parser.parse_args()
 
-    history = load_log_history(args.trainer_state)
-    plot_loss(history, args.output)
+    plot_training_losses(args.config_json, args.output)
+    # history = load_log_history(args.trainer_state)
+    # plot_loss(history, args.output)
 
 if __name__ == "__main__":
     main()

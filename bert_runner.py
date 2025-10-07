@@ -16,6 +16,7 @@ from transformers import (
     TrainingArguments,
 )
 import json
+from AdamWShart import CSharpAdamW
 
 def gen_label(lin_schedule, att_schedule): 
     return f"Linear Schedule: {lin_schedule} \n Attention Schedule: {att_schedule}"
@@ -95,8 +96,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.token_path, use_fast=True)
 
 
-    att_schedule = [[0, 0.0]]
-    lin_schedule = [[0.7, 0.0]]
+    att_schedule = [["2:4", 0.0]]
+    lin_schedule = [["2:4", 0.0], ["3:4", 0.25], [0, 0.5]]
     num_epochs = args.epochs
     batch_size = args.batch_size
 
@@ -131,9 +132,9 @@ def main():
         print("Baseline Model")
     else: 
         print("Sharting the Model")
-        # model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
-        # patch_bert_self_attention_k(model)
-        model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
+        model = respropify_bert_att_k(base_model, att_reuse_schedule=scaled_att_schedule, lin_reuse_schedule=scaled_lin_schedule, lin_k=1, att_k=1)
+        patch_bert_self_attention_k(model)
+        #model = respropify_bert(base_model, reuse_schedule=scaled_lin_schedule)
     if args.resume_path:
         # Get step from trainer state
         trainer_state_file = os.path.join(args.resume_path, "trainer_state.json")
@@ -184,14 +185,39 @@ def main():
 
         fp16=False,
         save_total_limit=3,
-        save_steps=200,
-        logging_steps=100,
+        save_steps=1000,
+        logging_steps=1000,
         dataloader_num_workers=args.num_proc,
         evaluation_strategy="no",
         local_rank=local_rank,
     )
 
     # 5) Trainer
+
+    # optimizer = CSharpAdamW(
+    #     model.parameters(),
+    #     lr=training_args.learning_rate,
+    #     betas=(0.9, 0.999),
+    #     eps=1e-6,
+    #     weight_decay=0.01,
+    #     reuse_k=10,   # only trust variance updates every 10 steps
+    # )
+
+    # optimizer = torch.optim.SGD(
+    #     model.parameters(),
+    #     lr=training_args.learning_rate,
+    #     momentum=0.9,                     # optional, can set to 0.0 for vanilla SGD
+    #     weight_decay=training_args.weight_decay,
+    # )
+
+    # # --- Trainer with SGD (no scheduler) ---
+    # trainer = Trainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_ds,
+    #     data_collator=data_collator,
+    #     optimizers=(optimizer, None),     # <-- replaces AdamW with SGD
+    # )
     trainer = Trainer(
         model=model,
         args=training_args,

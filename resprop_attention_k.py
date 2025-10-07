@@ -458,19 +458,49 @@ class ReSpropAttention(nn.Module):
     def extra_repr(self):
         return f"embed_dim={self.embed_dim}, reuse_percentage={self.reuse_percentage}"
 
+def _normalize_omitted(layers, omitted_layers):
+    """
+    Convert omitted_layers into a set of valid non-negative indices.
+    Handles negative indices like Python lists.
+    """
+    n = len(layers)
+    if omitted_layers is None:
+        return {0, n - 1}
+    result = set()
+    for idx in omitted_layers:
+        if idx < 0:
+            idx = n + idx  # convert negative index
+        if 0 <= idx < n:
+            result.add(idx)
+    return result
 
-def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedule=None, lin_k=1, att_k=1):
+def respropify_bert_att_k(
+    base_model,
+    att_reuse_schedule=None,
+    lin_reuse_schedule=None,
+    lin_k=1,
+    att_k=1,
+    omitted_layers=None,
+):
     model = copy.deepcopy(base_model).to(torch.cuda.current_device())
+    layers = model.bert.encoder.layer
+    omitted_layers = _normalize_omitted(layers, omitted_layers)
 
     def resprop_attention_block(att):
-        return ReSpropAttention(att, reuse_schedule=att_reuse_schedule, lin_reuse_schedule= lin_reuse_schedule, att_k=att_k, lin_k=lin_k)
+        return ReSpropAttention(
+            att,
+            reuse_schedule=att_reuse_schedule,
+            lin_reuse_schedule=lin_reuse_schedule,
+            att_k=att_k,
+            lin_k=lin_k,
+        )
 
     def resprop_linear(layer: nn.Linear):
         new_layer = ReSpropLinear(
             layer.in_features,
             layer.out_features,
             layer.bias is not None,
-            reuse_schedule=lin_reuse_schedule
+            reuse_schedule=lin_reuse_schedule,
         )
         new_layer.weight.data.copy_(layer.weight.data)
         if layer.weight.grad is not None:
@@ -480,7 +510,13 @@ def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedul
             if layer.bias.grad is not None:
                 new_layer.bias.grad.data.copy_(layer.bias.grad.data)
         return new_layer
-    for layer in model.bert.encoder.layer:
+
+    layers = model.bert.encoder.layer
+    for i, layer in enumerate(layers):
+        if i in omitted_layers:
+            print(f"Leaving layer {i} untouched")
+            continue
+
         att = layer.attention
         att.self.custom_attention = resprop_attention_block(att.self)
         layer.intermediate.dense = resprop_linear(layer.intermediate.dense)
@@ -489,16 +525,29 @@ def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedul
     return model
 
 
-def patch_bert_self_attention_k(model):
-    for layer in model.bert.encoder.layer:
+def patch_bert_self_attention_k(model, omitted_layers=None):
+    layers = model.bert.encoder.layer
+    omitted_layers = _normalize_omitted(layers, omitted_layers)
+
+    for i, layer in enumerate(layers):
+        if i in omitted_layers:
+            continue
+
         attn_self = layer.attention.self
 
         if not hasattr(attn_self, "_original_forward"):
             attn_self._original_forward = attn_self.forward
 
-        def new_forward(self, hidden_states, attention_mask=None, head_mask=None,
-                        encoder_hidden_states=None, encoder_attention_mask=None,
-                        past_key_value=None, output_attentions=False):
+        def new_forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            head_mask=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            past_key_value=None,
+            output_attentions=False,
+        ):
             if hasattr(self, "custom_attention"):
                 hidden_states = self.custom_attention(hidden_states)
 
@@ -511,16 +560,20 @@ def patch_bert_self_attention_k(model):
                         hidden_states.size(1),
                         hidden_states.size(1),
                         device=hidden_states.device,
-                        dtype=hidden_states.dtype
+                        dtype=hidden_states.dtype,
                     )
                     outputs += (dummy_attn_probs,)
 
                 return outputs
             else:
                 return self._original_forward(
-                    hidden_states, attention_mask, head_mask,
-                    encoder_hidden_states, encoder_attention_mask,
-                    past_key_value, output_attentions
+                    hidden_states,
+                    attention_mask,
+                    head_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    past_key_value,
+                    output_attentions,
                 )
 
         attn_self.forward = types.MethodType(new_forward, attn_self)
@@ -531,3 +584,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# Might have to write a custom optimizer with mask
+# Verify if this is problem with using SGD
