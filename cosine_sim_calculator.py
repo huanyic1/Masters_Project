@@ -4,8 +4,141 @@ import torch.nn.functional as F
 import copy
 import math
 import types
-from datasets import load_dataset
-from transformers import AutoTokenizer, BertForSequenceClassification
+#!/usr/bin/env python3
+import os
+import argparse
+from datasets import load_from_disk, concatenate_datasets, load_dataset
+from transformers import (
+    BertConfig,
+    BertForMaskedLM,
+    AutoTokenizer,
+    BertForMaskedLM,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+)
+from torch.utils.data import DataLoader
+from transformers import BertConfig, BertForMaskedLM, BertForSequenceClassification
+from copy import deepcopy
+
+
+def cos_sim(a, b, eps=1e-12):
+    """Cosine similarity with float64 precision and epsilon for numerical stability.
+
+    Uses float64 to avoid precision loss and adds epsilon to prevent division by zero.
+    """
+    a_flat = a.view(-1).to(torch.float64)
+    b_flat = b.view(-1).to(torch.float64)
+
+    # Compute cosine similarity manually with epsilon for stability
+    dot_product = (a_flat * b_flat).sum()
+    a_norm = a_flat.norm()
+    b_norm = b_flat.norm()
+
+    cos_val = (dot_product / (a_norm * b_norm + eps)).item()
+
+
+    return cos_val
+
+def cos_sim_second_moment(a, b, eps=1e-30):
+    """Cosine similarity of second moments (squared values) with numerically stable computation.
+
+    Problem: Computing dot(a^2, b^2) involves 4th powers which causes underflow for small values.
+
+    Solution: Use log-space arithmetic to avoid underflow:
+    cos(a^2, b^2) = exp(log(dot(a^2, b^2)) - 0.5*log(sum(a^4)) - 0.5*log(sum(b^4)))
+
+    We compute everything in log space, then exponentiate at the end.
+    """
+    # Check if a and b are actually the same object
+    same_object = a is b
+
+    a_flat = a.view(-1).to(torch.float64)
+    b_flat = b.view(-1).to(torch.float64) if not same_object else a_flat
+
+    # For same tensor, return 1.0 immediately
+    if same_object:
+        return 1.0
+
+    # Take absolute values to work in log space
+    a_abs = a_flat.abs()
+    b_abs = b_flat.abs()
+
+    # Compute log of squared values: log(a^2) = 2*log(|a|)
+    # Add eps to avoid log(0)
+    log_a_sq = 2.0 * torch.log(a_abs + eps)
+    log_b_sq = 2.0 * torch.log(b_abs + eps)
+
+    # For the dot product: dot(a^2, b^2) = sum(a^2 * b^2)
+    # In log space: log(sum(exp(log(a^2) + log(b^2))))
+    # This is the logsumexp operation
+    log_ab_sq = log_a_sq + log_b_sq  # Element-wise
+    log_dot = torch.logsumexp(log_ab_sq, dim=0)
+
+    # For the norms: norm(a^2)^2 = sum(a^4)
+    # log(sum(a^4)) = log(sum(exp(4*log(|a|))))
+    log_a_4 = 4.0 * torch.log(a_abs + eps)
+    log_b_4 = 4.0 * torch.log(b_abs + eps)
+
+    log_sum_a4 = torch.logsumexp(log_a_4, dim=0)
+    log_sum_b4 = torch.logsumexp(log_b_4, dim=0)
+
+    # norm(a^2) = sqrt(sum(a^4)) => log(norm(a^2)) = 0.5 * log(sum(a^4))
+    log_norm_a_sq = 0.5 * log_sum_a4
+    log_norm_b_sq = 0.5 * log_sum_b4
+
+    # Cosine = dot / (norm_a * norm_b)
+    # log(cosine) = log(dot) - log(norm_a) - log(norm_b)
+    log_cos = log_dot - log_norm_a_sq - log_norm_b_sq
+
+    # Convert back from log space
+    cos_val = torch.exp(log_cos).item()
+
+
+    return cos_val
+
+def cos_sim_batch(a, b, eps=1e-8):
+    """Mean cosine similarity over batch dimension."""
+    if a is None or b is None:
+        return 0.0
+    B = a.size(0)
+    a_flat = a.view(B, -1)
+    b_flat = b.view(1, -1).expand(B, -1)
+    a_norm = a_flat / (a_flat.norm(dim=-1, keepdim=True) + eps)
+    b_norm = b_flat / (b_flat.norm(dim=-1, keepdim=True) + eps)
+    return (a_norm * b_norm).sum(dim=-1).mean().item()
+
+cosine_logs = {
+    "lin_grad_inputs": 0.0,
+    "lin_grad_weights": 0.0,
+    "lin_v2_inputs": 0.0,
+    "lin_v2_weights": 0.0,
+    "lin_count": 0,
+    "att_grad_Q": 0.0,
+    "att_grad_K": 0.0,
+    "att_grad_V": 0.0,
+    "att_grad_probs": 0.0,
+    "att_v2_Q": 0.0,
+    "att_v2_K": 0.0,
+    "att_v2_V": 0.0,
+    "att_count": 0,
+}
+
+def print_cosine_logs():
+    """Aggregate printout every N steps."""
+    if cosine_logs["lin_count"] > 0:
+        print(f"[Linear] grad_input cos={cosine_logs['lin_grad_inputs']/cosine_logs['lin_count']:.4f}  "
+              f"grad_weight cos={cosine_logs['lin_grad_weights']/cosine_logs['lin_count']:.4f}  "
+              f"v2_input cos={cosine_logs['lin_v2_inputs']/cosine_logs['lin_count']:.4f}  "
+              f"v2_weight cos={cosine_logs['lin_v2_weights']/cosine_logs['lin_count']:.4f}")
+    if cosine_logs["att_count"] > 0:
+        print(f"[Attention] grad_Q={cosine_logs['att_grad_Q']/cosine_logs['att_count']:.4f}  "
+              f"grad_K={cosine_logs['att_grad_K']/cosine_logs['att_count']:.4f}  "
+              f"grad_V={cosine_logs['att_grad_V']/cosine_logs['att_count']:.4f}  "
+              f"v2_Q={cosine_logs['att_v2_Q']/cosine_logs['att_count']:.4f}  "
+              f"v2_K={cosine_logs['att_v2_K']/cosine_logs['att_count']:.4f}  "
+              f"v2_V={cosine_logs['att_v2_V']/cosine_logs['att_count']:.4f}")
+
 
 def compare_parameters(param1, param2, name=""):
     cos_sim = F.cosine_similarity(param1.view(-1), param2.view(-1), dim=0).item()
@@ -13,38 +146,6 @@ def compare_parameters(param1, param2, name=""):
     print(f"{name}:")
     print(f"  Cosine similarity: {cos_sim:.8f}")
     print(f"  Max absolute difference: {max_diff:.6e}")
-def cos_sim(a, b):
-    return F.cosine_similarity(a.view(-1), b.view(-1), dim=0).item()
-
-def cos_sim_batch(a, b, eps=1e-8):
-    # a, b: [B, *, *] → Flatten last two dims
-    B = a.size(0)
-    a_flat = a.view(B, -1)              # [B, T*T]
-    b_flat = b.view(1, -1).expand(B, -1)  # [B, T*T], broadcast b
-
-    a_norm = a_flat / (a_flat.norm(dim=-1, keepdim=True) + eps)
-    b_norm = b_flat / (b_flat.norm(dim=-1, keepdim=True) + eps)
-    return (a_norm * b_norm).sum(dim=-1).mean().item()  # [B]
-
-cosines = {}
-cosines['lin_grad_weights'] = 0
-cosines['lin_grad_inputs'] = 0
-cosines['lin_count'] = 0
-cosines['att_grad_V'] = 0
-cosines['att_grad_K'] = 0
-cosines['att_grad_Q'] = 0
-cosines['att_count'] = 0
-cosines['att_grad_probs'] = 0
-cosines['prev_V_prod'] = 0
-cosines['prev_attn_prod'] = 0
-cosines['prev_K_prod'] = 0
-cosines['prev_Q_prod'] = 0
-cosines['V_assump'] = 0
-cosines['att_probs_assump'] = 0
-cosines['V_assump_to_original'] = 0
-cosines['att_probs_assump_to_original'] = 0
-
-
 
 def get_current_reuse_percentage(reuse_schedule, step): 
     """
@@ -72,60 +173,67 @@ def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structu
         return grad_diff
 
     if structured:
-        shape = grad_diff.shape
-        last_dim = shape[-1]
-        remainder = last_dim % group_size
-        pad_needed = (group_size - remainder) if remainder != 0 else 0
+        pad = (group_size - grad_diff.shape[-1] % group_size) % group_size
+        if pad:
+            grad_diff = torch.nn.functional.pad(grad_diff, (0, pad))
 
-        # Pad the last dimension if necessary
-        if pad_needed > 0:
-            pad_shape = list(shape[:-1]) + [pad_needed]
-            pad_tensor = torch.zeros(pad_shape, device=grad_diff.device, dtype=grad_diff.dtype)
-            grad_diff = torch.cat([grad_diff, pad_tensor], dim=-1)
+        G = grad_diff.shape[-1] // group_size
+        x = grad_diff.view(*grad_diff.shape[:-1], G, group_size)
+        ax = x.abs()
 
-        # Reshape into (..., num_groups, group_size)
-        new_last_dim = grad_diff.shape[-1]
-        num_groups = new_last_dim // group_size
-        new_shape = grad_diff.shape[:-1] + (num_groups, group_size)
-        grad_diff_grouped = grad_diff.view(*new_shape)
+        # nth largest == kth smallest of (-abs) with k=n
+        kth_neg, _ = (-ax).kthvalue(k=n, dim=-1, keepdim=True)   # (..., G, 1)
+        thresh = -kth_neg                                         # (..., G, 1)
 
-        # Compute top-k mask within each group
-        abs_vals = grad_diff_grouped.abs()
-        topk = torch.topk(abs_vals, k=n, dim=-1)
-        threshold = topk.values.min(dim=-1, keepdim=True).values  # shape (..., G, 1)
-        reuse_mask = abs_vals >= threshold
+        # mask in-place without allocating zeros_like
+        out = x.clone()
+        out.masked_fill_(ax < thresh, 0)
 
-        # Apply the mask
-        masked_grad = torch.where(reuse_mask, grad_diff_grouped, torch.zeros_like(grad_diff_grouped))
-
-        # Reshape back to original padded shape, then trim off padding
-        masked_grad = masked_grad.view(*grad_diff.shape)
-        if pad_needed > 0:
-            masked_grad = masked_grad[..., :-pad_needed]
-
-        return masked_grad
-
+        out = out.view(*grad_diff.shape)
+        if pad:
+            out = out[..., :-pad]
+        return out
     else:
-        # Unstructured sparsity (elementwise top-k)
-        abs_grad_diff = torch.abs(grad_diff)
-        flat = abs_grad_diff.flatten()
-        threshold_idx = int(flat.size(0) * (1 - reuse_percentage))
-        threshold = torch.topk(flat, threshold_idx, largest=True).values[-1]
-        mask = abs_grad_diff > threshold
-        return torch.where(mask, grad_diff, torch.tensor(0., device=grad_diff.device))
+        N = grad_diff.numel()
+        k_keep = int(max(0, math.floor((1-reuse_percentage) * N)))
+        if k_keep <= 0:
+            return torch.zeros_like(grad_diff)
+        if k_keep >= N:
+            return grad_diff
+
+        abs_flat = grad_diff.abs().reshape(-1)
+        vals, idx = torch.topk(abs_flat, k_keep, largest=True, sorted=False)
+
+        out = torch.zeros_like(grad_diff).reshape(-1)
+        out.scatter_(0, idx, grad_diff.reshape(-1).index_select(0, idx))
+
+        return out.view_as(grad_diff)
+
+
+def correct_grad_norm(grad_output, prev_grad_output, reuse_grad):
+    """
+    grad_output: the current dense gradient (B,T,D)
+    prev_grad_output: the reused dense gradient (T,D)
+    reuse_grad: the hybrid gradient = (masked diff) + prev_grad_output
+    """
+    dense_norm = grad_output.norm(p=2)
+    reuse_norm = reuse_grad.norm(p=2).clamp(min=1e-8)
+    scale = (dense_norm / reuse_norm).detach()
+    return reuse_grad * scale
 
 
 class ReSpropLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, weight, bias, prev_grad_output, reuse_percentage, structured=False, n=2, group_size=4):
+    def forward(ctx, input, weight, bias, prev_grad_output, reuse_percentage, structured=False, n=2, group_size=4, step=0):
         prev_grad_output = prev_grad_output if prev_grad_output is not None else None
 
         if prev_grad_output is not None and len(input.shape) == 3 and prev_grad_output.size(0) == input.size(1):
-            # Precompute prev_grad_input and prev_grad_weight
-            prev_grad_input = torch.mm(prev_grad_output, weight)
-            prev_grad_weight = torch.mm(prev_grad_output.t(), torch.sum(input, dim=0))
+            with torch.no_grad():
+                prev_grad_input = prev_grad_output.matmul(weight).detach()              # [T, I]
+                sum_input = input.sum(dim=0)                                   # [T, I]
+                prev_grad_weight = prev_grad_output.t().matmul(sum_input).detach()  # [I, O]
         else:
-            if prev_grad_output is not None:
+            if prev_grad_output is not None and reuse_percentage > 0:
                 print("Warning: Couldn't reuse gradient due to shape mis-match.")
             prev_grad_output = prev_grad_input = prev_grad_weight = None
 
@@ -133,19 +241,24 @@ class ReSpropLinearFunction(torch.autograd.Function):
         ctx.structured = structured
         ctx.n = n
         ctx.group_size = group_size
-        ctx.save_for_backward(input, weight, bias, prev_grad_output, prev_grad_input, prev_grad_weight)
+        ctx.prev_grad_output = prev_grad_output
+        ctx.prev_grad_input = prev_grad_input
+        ctx.prev_grad_weight = prev_grad_weight
+        ctx.save_for_backward(input, weight, bias)
+        ctx.step = step
 
-        output = torch.bmm(input, weight.t().expand(input.size(0), -1, -1))
-        if bias is not None:
-            output += bias
-        return output
+        B, T, I = input.shape
+        out = F.linear(input.view(-1, I), weight, bias)  # [(B*T), O]
+        return out.view(B, T, weight.size(0))
 
     @staticmethod
     def backward(ctx, grad_output):
-        input, weight, bias, prev_grad_output, prev_grad_input, prev_grad_weight = ctx.saved_tensors
+        input, weight, bias = ctx.saved_tensors
+        prev_grad_output, prev_grad_input, prev_grad_weight = ctx.prev_grad_output, ctx.prev_grad_input, ctx.prev_grad_weight
 
+        og_grad_output = grad_output
         grad_input = grad_weight = grad_bias = None
-        og_grad_output= grad_output
+
         # Compute reuse mask
         if prev_grad_output is not None:
             grad_diff = generate_reuse_mask(ctx.reuse_percentage, grad_output, prev_grad_output, ctx.structured, ctx.n, ctx.group_size)
@@ -153,24 +266,34 @@ class ReSpropLinearFunction(torch.autograd.Function):
         
         # Compute gradients
         if ctx.needs_input_grad[0]:
-            grad_input = torch.bmm(grad_output, weight.expand(grad_output.size(0), -1, -1))
+            grad_input = grad_output.matmul(weight)
             if prev_grad_output is not None:
-                grad_input += prev_grad_input
+                grad_input = grad_input.add(prev_grad_input.unsqueeze(0))
+                #grad_input = correct_grad_norm(grad_output, prev_grad_output, grad_input)
+
 
         if ctx.needs_input_grad[1]:
-            grad_weight = torch.sum(torch.bmm(grad_output.transpose(1, 2), input), dim=0)
+            grad_weight = torch.einsum('bto,bti->oi', grad_output, input)
             if prev_grad_output is not None:
-                grad_weight += prev_grad_weight
-
-        if prev_grad_output is not None:
-            og_grad_input = torch.bmm(og_grad_output, weight.expand(og_grad_output.size(0), -1, -1))
-            og_grad_weight = torch.sum(torch.bmm(og_grad_output.transpose(1, 2), input), dim=0)
-            cosines['lin_grad_inputs']+=  cos_sim(og_grad_input, grad_input)
-            cosines['lin_grad_weights']+=  cos_sim(og_grad_weight, grad_weight)
-            cosines['lin_count'] += 1
+                grad_weight = grad_weight.add(prev_grad_weight)
+                #grad_weight = correct_grad_norm(grad_output, prev_grad_output, grad_weight)
 
         if bias is not None and ctx.needs_input_grad[2]:
-            grad_bias = grad_output.sum((0, 1))
+            grad_bias = grad_output.sum(dim=(0, 1))
+
+        # --- Logging for analysis ---
+        if prev_grad_output is not None:
+            # "True" reference (no reuse) gradients
+            og_grad_input = torch.matmul(og_grad_output, weight)
+            og_grad_weight = torch.einsum('bto,bti->oi', og_grad_output, input)
+
+            cosine_logs['lin_grad_inputs'] += cos_sim(og_grad_input, grad_input)
+            cosine_logs['lin_grad_weights'] += cos_sim(og_grad_weight, grad_weight)
+
+            # Second-moment cosine: compare g^2 terms (use numerically stable version)
+            cosine_logs['lin_v2_inputs'] += cos_sim_second_moment(og_grad_input, grad_input)
+            cosine_logs['lin_v2_weights'] += cos_sim_second_moment(og_grad_weight, grad_weight)
+            cosine_logs['lin_count'] += 1
 
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None
 
@@ -187,7 +310,6 @@ class ReSpropLinear(nn.Linear):
         device = input.device
         self.prev_gradients.setdefault(device, None)
         self.step_counter.setdefault(device, 0)
-
         step = self.step_counter[device]
         num1, num2, structured = get_current_reuse_percentage(self.reuse_schedule, step)
         if not structured:
@@ -195,9 +317,12 @@ class ReSpropLinear(nn.Linear):
             n = None
             group_size = None
         else:
-            reuse_percentage = None
+            reuse_percentage = num1/num2
             n = num1
             group_size = num2
+
+        # if step % 250 == 0: 
+        #     reuse_percentage = 0
 
         output = ReSpropLinearFunction.apply(
             input, self.weight,
@@ -206,16 +331,17 @@ class ReSpropLinear(nn.Linear):
             reuse_percentage, 
             structured,
             n,
-            group_size
+            group_size, 
+            step
         )
 
         if output.requires_grad:
             def hook(grad_output):
-                if self.step_counter[device] % self.k == 0:
-                    if self.avg:
-                        self.prev_gradients[device] = torch.mean(grad_output, dim=0)
-                    else: 
-                        self.prev_gradients[device] = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
+                # if reuse_percentage > 0: #and self.step_counter[device] % self.k == 0:
+                if self.avg:
+                    self.prev_gradients[device] =  grad_output.sum(dim=0) / grad_output.size(0) # torch.mean(grad_output, dim=0) #
+                else: 
+                    self.prev_gradients[device] = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
                 self.step_counter[device] += 1
                 
             output.register_hook(hook)
@@ -225,7 +351,7 @@ class ReSpropLinear(nn.Linear):
     def extra_repr(self):
         return super().extra_repr() + f", reuse_percentage={self.reuse_percentage}"
 
-        
+
 class ReSpropAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod, reuse_percentage, structured=False, n=2, group_size=4):
@@ -241,18 +367,28 @@ class ReSpropAttentionFunction(torch.autograd.Function):
         ctx.structured = structured
         ctx.n = n
         ctx.group_size = group_size
-        ctx.save_for_backward(Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod)
+        ctx.prev_grad_output = None if prev_grad_output is None else prev_grad_output.detach()
+        ctx.prev_attn_prod  = None if prev_attn_prod  is None else prev_attn_prod.detach()
+        ctx.prev_V_prod     = None if prev_V_prod     is None else prev_V_prod.detach()
+        ctx.prev_soft_grad  = None if prev_soft_grad  is None else prev_soft_grad.detach()
+        ctx.prev_K_prod     = None if prev_K_prod     is None else prev_K_prod.detach()
+        ctx.prev_Q_prod     = None if prev_Q_prod     is None else prev_Q_prod.detach()
 
+        ctx.save_for_backward(Q, K, V)
+        
         d_k = Q.size(-1)
-        attn_scores = torch.bmm(Q, K.transpose(1, 2)) / (d_k ** 0.5)
-        attn_probs = torch.softmax(attn_scores, dim=-1)
-        ctx.attn_probs = attn_probs  # current softmax
+        attn_scores = torch.einsum('btd, bud -> btu', Q, K) * (d_k ** -0.5)
+        attn_probs = attn_scores.softmax(dim=-1)
 
-        return torch.bmm(attn_probs, V)
+        ctx.attn_probs = attn_probs.detach()
+
+        return torch.einsum('btu, buv -> btv', attn_probs, V)
 
     @staticmethod
     def backward(ctx, grad_output):
-        Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod = ctx.saved_tensors
+        Q, K, V = ctx.saved_tensors
+        prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod = ctx.prev_grad_output, ctx.prev_attn_prod, ctx.prev_V_prod, ctx.prev_soft_grad, ctx.prev_K_prod, ctx.prev_Q_prod
+
         
         attn_probs = ctx.attn_probs
         d_k = Q.size(-1)
@@ -260,78 +396,54 @@ class ReSpropAttentionFunction(torch.autograd.Function):
 
         if prev_grad_output is not None and ctx.reuse_percentage > 0:
             grad_diff = generate_reuse_mask(ctx.reuse_percentage, grad_output, prev_grad_output, ctx.structured, ctx.n, ctx.group_size)
-            grad_attn_probs = torch.bmm(grad_diff, V.transpose(1, 2)) + prev_V_prod
+            grad_attn_probs = torch.einsum('btv, buv -> btu', grad_diff, V) + prev_V_prod
             if ctx.needs_input_grad[2]:
-                grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_diff) + prev_attn_prod
-
-
-            prev_grad_exp = prev_grad_output.expand(V.size(0), -1, -1)  # [B, T, d_v]
-            og_prev_V_prod = torch.bmm(prev_grad_exp, V.transpose(1, 2))
-            og_whole_attn_prob = torch.bmm(grad_diff, V.transpose(1, 2)) + og_prev_V_prod
-            cosines['att_probs_assump']+=  cos_sim(og_whole_attn_prob, grad_attn_probs)
-
-            og_prev_attn_prod = torch.bmm(attn_probs.transpose(1, 2), prev_grad_exp)
-            og_whole_grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_diff) + og_prev_attn_prod
-            cosines['V_assump']+=  cos_sim(og_whole_grad_V, grad_V)
-
+                grad_V = torch.einsum('btu,btv->buv', attn_probs, grad_diff) + prev_attn_prod
+                #grad_V = correct_grad_norm(grad_output, prev_grad_output, grad_V)
         else: 
-            grad_attn_probs = torch.bmm(grad_output, V.transpose(1, 2))
+            grad_attn_probs = torch.einsum('btv, buv -> btu', grad_output, V)
             if ctx.needs_input_grad[2]:
-                grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_output)
+                grad_V = torch.einsum('btu,btv->buv', attn_probs, grad_output)
 
-       
-
-        if prev_grad_output is not None:
-            og_grad_attn_probs = torch.bmm(grad_output, V.transpose(1, 2))
-            og_grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_output)
-            cosines['att_grad_probs']+=  cos_sim(og_grad_attn_probs, grad_attn_probs)
-            cosines['att_grad_V']+=  cos_sim(og_grad_V, grad_V)
-            cosines['att_count'] += 1
-            og_grad_attn_scores = og_grad_attn_probs * attn_probs
-            og_grad_attn_scores -= attn_probs * og_grad_attn_scores.sum(dim=-1, keepdim=True)
-            og_grad_attn_scores /= (d_k ** 0.5)
-
-            if ctx.reuse_percentage > 0:
-                cosines['V_assump_to_original'] += cos_sim(og_grad_V, og_whole_grad_V)
-                cosines['att_probs_assump_to_original'] += cos_sim(og_grad_attn_probs, og_whole_attn_prob)
-
-            
-            # THESE SHOULD BE INDEPENDENT OF THE REUSE_PERCENTAGE
-            prev_grad_exp = prev_grad_output.expand(V.size(0), -1, -1)  # [B, T, d_v]
-            og_prev_V_prod = torch.bmm(prev_grad_exp, V.transpose(1, 2))
-            cosines['prev_V_prod']+=  cos_sim_batch(og_prev_V_prod, prev_V_prod)
-            og_prev_attn_prod = torch.bmm(attn_probs.transpose(1, 2), prev_grad_exp)
-            cosines['prev_attn_prod']+=  cos_sim_batch(og_prev_attn_prod, prev_attn_prod)
-
-
-        grad_attn_scores = grad_attn_probs * attn_probs
-        grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
-        grad_attn_scores /= (d_k ** 0.5)
+        row_dot = (grad_attn_probs * attn_probs).sum(dim=-1, keepdim=True)  # [B, T, 1]
+        grad_attn_scores = (grad_attn_probs - row_dot) * attn_probs         # [B, T, T]
+        grad_attn_scores = grad_attn_scores * (d_k ** -0.5)
 
         if prev_soft_grad is not None and ctx.reuse_percentage > 0:
             grad_attn_diff = generate_reuse_mask(ctx.reuse_percentage, grad_attn_scores, prev_soft_grad, ctx.structured, ctx.n, ctx.group_size)
             if ctx.needs_input_grad[0]:
-                grad_Q = torch.bmm(grad_attn_diff, K) + prev_K_prod
+                grad_Q = torch.einsum('btu, bud -> btd', grad_attn_diff, K) + prev_K_prod
+                #grad_Q = correct_grad_norm(grad_attn_scores, prev_soft_grad, grad_Q)
             if ctx.needs_input_grad[1]:
-                grad_K = torch.bmm(grad_attn_diff.transpose(1, 2), Q) + prev_Q_prod
-        else: 
+                grad_K = torch.einsum('btu, btd -> bud', grad_attn_diff, Q) + prev_Q_prod
+                #grad_K = correct_grad_norm(grad_attn_scores, prev_soft_grad, grad_K)
+        else:
             if ctx.needs_input_grad[0]:
-                grad_Q = torch.bmm(grad_attn_scores, K)
+                grad_Q = torch.einsum('btu, bud -> btd', grad_attn_scores, K)
             if ctx.needs_input_grad[1]:
-                grad_K = torch.bmm(grad_attn_scores.transpose(1, 2), Q)
+                grad_K = torch.einsum('btu, btd -> bud', grad_attn_scores, Q)
 
         if prev_grad_output is not None:
-            og_grad_Q = torch.bmm(og_grad_attn_scores, K)
-            og_grad_K = torch.bmm(og_grad_attn_scores.transpose(1, 2), Q)
-            cosines['att_grad_Q']+=  cos_sim(og_grad_Q, grad_Q)
-            cosines['att_grad_K']+=  cos_sim(og_grad_K, grad_K)
+            # True baseline (dense)
+            d_k = Q.size(-1)
+            attn_probs = ctx.attn_probs
+            og_grad_attn_probs = torch.einsum('btv, buv -> btu', grad_output, V)
+            og_grad_attn_scores = (og_grad_attn_probs - (og_grad_attn_probs * attn_probs).sum(dim=-1, keepdim=True)) * attn_probs * (d_k ** -0.5)
+            og_grad_Q = torch.einsum('btu,bud->btd', og_grad_attn_scores, K)
+            og_grad_K = torch.einsum('btu,btd->bud', og_grad_attn_scores, Q)
+            og_grad_V = torch.einsum('btu,btv->buv', attn_probs, grad_output)
 
-            # THESE SHOULD BE INDEPENDENT OF THE REUSE_PERCENTAGE
-            prev_soft_grad_exp = prev_soft_grad.expand(K.size(0), -1, -1)
-            og_prev_K_prod = torch.bmm(prev_soft_grad_exp, K)
-            cosines['prev_K_prod']+=  cos_sim_batch(og_prev_K_prod, prev_K_prod)
-            og_prev_Q_prod = torch.bmm(prev_soft_grad_exp.transpose(1, 2), Q)
-            cosines['prev_Q_prod']+=  cos_sim_batch(og_prev_Q_prod, prev_Q_prod)
+
+            cosine_logs['att_grad_Q'] += cos_sim(og_grad_Q, grad_Q)
+            cosine_logs['att_grad_K'] += cos_sim(og_grad_K, grad_K)
+            cosine_logs['att_grad_V'] += cos_sim(og_grad_V, grad_V)
+            cosine_logs['att_grad_probs'] += cos_sim(og_grad_attn_probs, grad_attn_probs)
+
+            # Second-moment cosine (squared gradients) - use numerically stable version
+            cosine_logs['att_v2_Q'] += cos_sim_second_moment(og_grad_Q, grad_Q)
+            cosine_logs['att_v2_K'] += cos_sim_second_moment(og_grad_K, grad_K)
+            cosine_logs['att_v2_V'] += cos_sim_second_moment(og_grad_V, grad_V)
+            cosine_logs['att_count'] += 1
 
         return grad_Q, grad_K, grad_V, None, None, None, None, None, None, None, None, None, None
    
@@ -391,9 +503,12 @@ class ReSpropAttention(nn.Module):
             n = None
             group_size = None
         else:
-            reuse_percentage = None
+            reuse_percentage = num1/num2
             n = num1
             group_size = num2
+
+        # if self.step_counter[device] % 250 == 0: 
+        #     reuse_percentage = 0
         
         Q = self.q_proj(hidden_states)
         K = self.k_proj(hidden_states)
@@ -414,35 +529,45 @@ class ReSpropAttention(nn.Module):
         )
         if output.requires_grad:
             def hook(grad_output):
-                if self.step_counter[device] % self.k == 0:
+                if reuse_percentage>0 and self.step_counter[device] % self.k == 0:
                     with torch.no_grad():
-                        sampled_grad = grad_output.mean(dim=0, keepdim=True).detach()  # [1, T, d]
 
-                        Q_ = Q.mean(dim=0, keepdim=True)  # [1, T, d_k]
-                        K_ = K.mean(dim=0, keepdim=True)  # [1, T, d_k]
-                        V_ = V.mean(dim=0, keepdim=True)  # [1, T, d_v]
+                        sampled_grad = grad_output.mean(dim=0, keepdim=True).detach()   # [1, T, d]
+                        Q_ = Q.mean(dim=0, keepdim=True)                                 # [1, T, d_k]
+                        K_ = K.mean(dim=0, keepdim=True)                                 # [1, T, d_k]
+                        V_ = V.mean(dim=0, keepdim=True)                                 # [1, T, d_v]
+
                         d_k = Q.size(-1)
+                        inv_sqrt_dk = 1.0 / math.sqrt(d_k)
 
-                        attn_scores = torch.bmm(Q_, K_.transpose(1, 2)) / (d_k ** 0.5)  # [1, T, T]
-                        attn_probs = torch.softmax(attn_scores, dim=-1)                 # [1, T, T]
+                        # Attn probs: A = softmax((Q K^T) / sqrt(d_k)) → [1, T, T]
+                        attn_scores = torch.einsum('btd,bud->btu', Q_, K_) * inv_sqrt_dk
+                        attn_probs  = attn_scores.softmax(dim=-1)                         # [1, T, T]
 
-                        attn_prod = torch.bmm(attn_probs.transpose(1, 2), sampled_grad)  # [1, T, d]
-                        V_prod = torch.bmm(sampled_grad, V_.transpose(1, 2))             # [1, d, T]
+                        # dL/dV: A^T @ sampled_grad → [1, T, d]
+                        attn_prod = torch.einsum('btu,btd->bud', attn_probs, sampled_grad)  # uses A^T implicitly via indices
 
-                        grad_softmax = torch.bmm(sampled_grad, V_.transpose(1, 2))       # [1, T, T]
-                        grad_attn_scores = grad_softmax * attn_probs                     # [1, T, T]
-                        grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
-                        grad_attn_scores /= (d_k ** 0.5)
+                        # G = dL/dA = sampled_grad @ V^T → [1, T, T]
+                        V_prod = torch.einsum('btd,bdu->btu', sampled_grad, V_.transpose(1, 2))
 
-                        K_prod = torch.bmm(grad_attn_scores, K_)                         # [1, T, d]
-                        Q_prod = torch.bmm(grad_attn_scores.transpose(1, 2), Q_)         # [1, T, d]
 
+                        grad_attn_probs = torch.einsum('btv, buv -> btu', sampled_grad, V_)
+                        row_dot = (grad_attn_probs * attn_probs).sum(dim=-1, keepdim=True)  
+                        grad_attn_scores = (grad_attn_probs - row_dot) * attn_probs    
+                        grad_attn_scores = grad_attn_scores * inv_sqrt_dk
+
+
+                        # K/Q products for reuse
+                        K_prod = torch.einsum('btu,bud->btd', grad_attn_scores, K_)        # [1, T, d_k]
+                        Q_prod = torch.einsum('but,btd->bud', grad_attn_scores, Q_)        # [1, T, d_k]
+
+                        # Cache (detached)
                         self.prev_grad_output[device] = sampled_grad
-                        self.prev_attn_prods[device] = attn_prod.detach()
-                        self.prev_V_prods[device] = V_prod.detach()
-                        self.prev_soft_grads[device] = grad_attn_scores.detach()
-                        self.prev_K_prods[device] = K_prod.detach()
-                        self.prev_Q_prods[device] = Q_prod.detach()
+                        self.prev_attn_prods[device]  = attn_prod.detach()
+                        self.prev_V_prods[device]     = V_prod.detach()            # (same as old grad_softmax)
+                        self.prev_soft_grads[device]  = grad_attn_scores.detach()
+                        self.prev_K_prods[device]     = K_prod.detach()
+                        self.prev_Q_prods[device]     = Q_prod.detach()
 
                 self.step_counter[device] += 1
 
@@ -454,19 +579,49 @@ class ReSpropAttention(nn.Module):
     def extra_repr(self):
         return f"embed_dim={self.embed_dim}, reuse_percentage={self.reuse_percentage}"
 
+def _normalize_omitted(layers, omitted_layers):
+    """
+    Convert omitted_layers into a set of valid non-negative indices.
+    Handles negative indices like Python lists.
+    """
+    n = len(layers)
+    if omitted_layers is None:
+        return {0, n - 1}
+    result = set()
+    for idx in omitted_layers:
+        if idx < 0:
+            idx = n + idx  # convert negative index
+        if 0 <= idx < n:
+            result.add(idx)
+    return result
 
-def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedule=None, lin_k=1, att_k=1):
+def respropify_bert_att_k(
+    base_model,
+    att_reuse_schedule=None,
+    lin_reuse_schedule=None,
+    lin_k=1,
+    att_k=1,
+    omitted_layers=None,
+):
     model = copy.deepcopy(base_model).to(torch.cuda.current_device())
+    layers = model.bert.encoder.layer
+    omitted_layers = _normalize_omitted(layers, omitted_layers)
 
     def resprop_attention_block(att):
-        return ReSpropAttention(att, reuse_schedule=att_reuse_schedule, lin_reuse_schedule= lin_reuse_schedule, att_k=att_k, lin_k=lin_k)
+        return ReSpropAttention(
+            att,
+            reuse_schedule=att_reuse_schedule,
+            lin_reuse_schedule=lin_reuse_schedule,
+            att_k=att_k,
+            lin_k=lin_k,
+        )
 
     def resprop_linear(layer: nn.Linear):
         new_layer = ReSpropLinear(
             layer.in_features,
             layer.out_features,
             layer.bias is not None,
-            reuse_schedule=lin_reuse_schedule
+            reuse_schedule=lin_reuse_schedule,
         )
         new_layer.weight.data.copy_(layer.weight.data)
         if layer.weight.grad is not None:
@@ -476,7 +631,13 @@ def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedul
             if layer.bias.grad is not None:
                 new_layer.bias.grad.data.copy_(layer.bias.grad.data)
         return new_layer
-    for layer in model.bert.encoder.layer:
+
+    layers = model.bert.encoder.layer
+    for i, layer in enumerate(layers):
+        if i in omitted_layers:
+            print(f"Leaving layer {i} untouched")
+            continue
+
         att = layer.attention
         att.self.custom_attention = resprop_attention_block(att.self)
         layer.intermediate.dense = resprop_linear(layer.intermediate.dense)
@@ -485,16 +646,29 @@ def respropify_bert_att_k(base_model, att_reuse_schedule=None, lin_reuse_schedul
     return model
 
 
-def patch_bert_self_attention_k(model):
-    for layer in model.bert.encoder.layer:
+def patch_bert_self_attention_k(model, omitted_layers=None):
+    layers = model.bert.encoder.layer
+    omitted_layers = _normalize_omitted(layers, omitted_layers)
+
+    for i, layer in enumerate(layers):
+        if i in omitted_layers:
+            continue
+
         attn_self = layer.attention.self
 
         if not hasattr(attn_self, "_original_forward"):
             attn_self._original_forward = attn_self.forward
 
-        def new_forward(self, hidden_states, attention_mask=None, head_mask=None,
-                        encoder_hidden_states=None, encoder_attention_mask=None,
-                        past_key_value=None, output_attentions=False):
+        def new_forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            head_mask=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            past_key_value=None,
+            output_attentions=False,
+        ):
             if hasattr(self, "custom_attention"):
                 hidden_states = self.custom_attention(hidden_states)
 
@@ -507,46 +681,38 @@ def patch_bert_self_attention_k(model):
                         hidden_states.size(1),
                         hidden_states.size(1),
                         device=hidden_states.device,
-                        dtype=hidden_states.dtype
+                        dtype=hidden_states.dtype,
                     )
                     outputs += (dummy_attn_probs,)
 
                 return outputs
             else:
                 return self._original_forward(
-                    hidden_states, attention_mask, head_mask,
-                    encoder_hidden_states, encoder_attention_mask,
-                    past_key_value, output_attentions
+                    hidden_states,
+                    attention_mask,
+                    head_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    past_key_value,
+                    output_attentions,
                 )
 
         attn_self.forward = types.MethodType(new_forward, attn_self)
 
 
-def print_cosine_stats(): 
-    print(f"cosine similarity linear weight: {cosines['lin_grad_weights']/cosines['lin_count']}")
-    print(f"cosine similarity linear input: {cosines['lin_grad_inputs']/cosines['lin_count']}")
-    print(f"cosine similarity attention V: {cosines['att_grad_V']/cosines['att_count']}")
-    print(f"cosine similarity attention K: {cosines['att_grad_K']/cosines['att_count']}")
-    print(f"cosine similarity attention Q: {cosines['att_grad_Q']/cosines['att_count']}")
-    print(f"cosine similarity attention input: {cosines['att_grad_probs']/cosines['att_count']}")
-    print(f"cosine similarity attention precompute attn prod: {cosines['prev_attn_prod']/cosines['att_count']}")
-    print(f"cosine similarity attention precompute V prod: {cosines['prev_V_prod']/cosines['att_count']}")
-    print(f"cosine similarity attention precompute K prod: {cosines['prev_K_prod']/cosines['att_count']}")
-    print(f"cosine similarity attention precompute Q prod: {cosines['prev_Q_prod']/cosines['att_count']}")
-    print(f"cosine similarity attention V assumption: {cosines['V_assump']/cosines['att_count']}")
-    print(f"cosine similarity attention probs assumption: {cosines['att_probs_assump']/cosines['att_count']}")
-    print(f"cosine similarity attention V assumption to original: {cosines['V_assump_to_original']/cosines['att_count']}")
-    print(f"cosine similarity attention probs assumption to original: {cosines['att_probs_assump_to_original']/cosines['att_count']}")
 
 
-def main(): 
+def main(args): 
     model_name = "bert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    dataset = load_dataset("fancyzhx/yelp_polarity")
+
 
     num_train = 128*5
     def tokenize_function(examples):
         return tokenizer(examples["text"], max_length=128, padding="max_length", truncation=True)
+
+    
+    dataset = load_dataset("fancyzhx/yelp_polarity")
 
     tokenized_datasets = dataset.map(tokenize_function, batched=True)
     train_dataset = tokenized_datasets["train"].select(range(num_train))
@@ -558,41 +724,80 @@ def main():
     # Load models
     base_model = BertForSequenceClassification.from_pretrained(
         model_name,
-        attn_implementation="eager",
         num_labels=2,
         id2label={0: "Negative", 1: "Positive"}
     )
-    cos = {}
-    cos['Activation'] = []
-    cos['Weight'] = []
-    cos['Q'] = []
-    cos['K'] = []
-    cos['V'] = []
-    for reuse_pct in [0, 0.5, 0.75, 0.9, 0.99]: 
-        for key in cosines.keys():
-            cosines[key] = 0
-        model = respropify_bert_att_k(base_model, att_reuse_schedule=[(reuse_pct, 0)], lin_reuse_schedule=[(reuse_pct, 0)], lin_k=1, att_k=1)
-        patch_bert_self_attention_k(model)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
 
+    cos = {
+        'Activation': [], 'Weight': [],
+        'Q': [], 'K': [], 'V': [],
+        'V2_Activation': [], 'V2_Weight': [],
+        'V2_Q': [], 'V2_K': [], 'V2_V': []
+    }
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for reuse_pct in [0.0, 0.5, 0.75, 0.9, 0.99]:
+        print(f"=== Running reuse_pct={reuse_pct:.2f} ===")
+        # Reset logs
+        for key in cosine_logs.keys():
+            cosine_logs[key] = 0.0 if isinstance(cosine_logs[key], float) else 0
+        cosine_logs['lin_count'] = 0
+        cosine_logs['att_count'] = 0
+
+        # Build respropified model with reuse_pct
+        model = respropify_bert_att_k(
+            base_model,
+            att_reuse_schedule=[(reuse_pct, 0)],
+            lin_reuse_schedule=[(reuse_pct, 0)],
+            lin_k=1,
+            att_k=1, 
+            omitted_layers={}
+        )
+        patch_bert_self_attention_k(model)
+        model.to(device)
         model.eval()
-        for batch in dataloader:
-            batch["labels"] = batch.pop("label")
-            batch = {k: v.to(device) for k, v in batch.items()} 
+
+        # Stock AdamW (unused updates, only backward)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+        #Run a few forward/backward passes
+        for step, batch in enumerate(dataloader):
+            batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch)
             loss = outputs.loss
-            logits = outputs.logits.detach().cpu()
             loss.backward()
-        
-        cos['Activation'].append(cosines['lin_grad_inputs']/cosines['lin_count'])
-        cos['Weight'].append(cosines['lin_grad_weights']/cosines['lin_count'])
-        cos['Q'].append(cosines['att_grad_Q']/cosines['att_count'])
-        cos['K'].append(cosines['att_grad_K']/cosines['att_count'])
-        cos['V'].append(cosines['att_grad_V']/cosines['att_count'])
-        # print_cosine_stats()
-    print(cos)
 
+        # for batch in dataloader:
+        #     batch["labels"] = batch.pop("label")
+        #     batch = {k: v.to(device) for k, v in batch.items()} 
+        #     outputs = model(**batch)
+        #     loss = outputs.loss
+        #     logits = outputs.logits.detach().cpu()
+        #     loss.backward()
+
+        # Aggregate cosine metrics
+        cos['Activation'].append(cosine_logs['lin_grad_inputs'] / max(1, cosine_logs['lin_count']))
+        cos['Weight'].append(cosine_logs['lin_grad_weights'] / max(1, cosine_logs['lin_count']))
+        cos['Q'].append(cosine_logs['att_grad_Q'] / max(1, cosine_logs['att_count']))
+        cos['K'].append(cosine_logs['att_grad_K'] / max(1, cosine_logs['att_count']))
+        cos['V'].append(cosine_logs['att_grad_V'] / max(1, cosine_logs['att_count']))
+
+        cos['V2_Activation'].append(cosine_logs['lin_v2_inputs'] / max(1, cosine_logs['lin_count']))
+        cos['V2_Weight'].append(cosine_logs['lin_v2_weights'] / max(1, cosine_logs['lin_count']))
+        cos['V2_Q'].append(cosine_logs['att_v2_Q'] / max(1, cosine_logs['att_count']))
+        cos['V2_K'].append(cosine_logs['att_v2_K'] / max(1, cosine_logs['att_count']))
+        cos['V2_V'].append(cosine_logs['att_v2_V'] / max(1, cosine_logs['att_count']))
+
+        print_cosine_logs()
+        torch.cuda.empty_cache()
+
+    print("\n=== Final Cosine Summary ===")
+    for k, v in cos.items():
+        print(f"{k}: {v}")
 
 if __name__ == "__main__": 
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cache_dir", type=str, default="./training_data")
+    parser.add_argument("--token_path", type=str, default="bert-base-uncased")
+    parser.add_argument("--mlm_probability", type=float, default=0.15)
+    args = parser.parse_args()
+    main(args)
