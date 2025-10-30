@@ -708,25 +708,49 @@ def main(args):
 
 
     num_train = 128*5
-    def tokenize_function(examples):
-        return tokenizer(examples["text"], max_length=128, padding="max_length", truncation=True)
+    # def tokenize_function(examples):
+    #     return tokenizer(examples["text"], max_length=128, padding="max_length", truncation=True)
 
     
-    dataset = load_dataset("fancyzhx/yelp_polarity")
+    # dataset = load_dataset("fancyzhx/yelp_polarity")
 
-    tokenized_datasets = dataset.map(tokenize_function, batched=True)
-    train_dataset = tokenized_datasets["train"].select(range(num_train))
+    # tokenized_datasets = dataset.map(tokenize_function, batched=True)
+    # train_dataset = tokenized_datasets["train"].select(range(num_train))
 
-    train_dataset.set_format(type='torch', columns=["input_ids", "attention_mask", "label"])
+    # train_dataset.set_format(type='torch', columns=["input_ids", "attention_mask", "label"])
     
-    dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=128)
+    # dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=32)
 
-    # Load models
-    base_model = BertForSequenceClassification.from_pretrained(
-        model_name,
-        num_labels=2,
-        id2label={0: "Negative", 1: "Positive"}
+    # # Load models
+    # base_model = BertForSequenceClassification.from_pretrained(
+    #     model_name,
+    #     num_labels=2,
+    #     id2label={0: "Negative", 1: "Positive"}
+    # )
+
+    ds_dict = load_from_disk(os.path.join('./training_data', "wiki_owt_block128"))
+    train_ds = ds_dict['train']
+
+    config = BertConfig(
+        vocab_size=30522,             # WordPiece vocab size
+        hidden_size=768,              # Transformer hidden dimension
+        num_hidden_layers=12,         # Number of Transformer blocks
+        num_attention_heads=12,       # Heads per self-attention
+        intermediate_size=3072,       # Feed-forward hidden dimension
+        hidden_act="gelu",            # Activation function
+        hidden_dropout_prob=0.1,      # Dropout on hidden layers
+        attention_probs_dropout_prob=0.1,  # Dropout on attention weights
+        max_position_embeddings=512,  # Maximum sequence length
+        type_vocab_size=2,            # For segment embeddings (NSP)
+        initializer_range=0.02,       # Weight init std
+        layer_norm_eps=1e-12,         # Epsilon inside LayerNorm
     )
+
+    base_model = BertForMaskedLM(config)
+
+    train_ds = train_ds.select(range(num_train))
+    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
+    dataloader = DataLoader(train_ds, batch_size=32, shuffle=False, collate_fn=collator)
 
     cos = {
         'Activation': [], 'Weight': [],

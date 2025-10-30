@@ -40,23 +40,43 @@ def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structu
     if reuse_percentage == 0:
         return grad_diff
 
+    # ===== RANDOM SPARSITY (for testing) =====
+    # Randomly zero out elements instead of magnitude-based selection
+    # N = grad_diff.numel()
+    # k_keep = int(max(0, math.floor((1-reuse_percentage) * N)))
+    # if k_keep <= 0:
+    #     return torch.zeros_like(grad_diff)
+    # if k_keep >= N:
+    #     return grad_diff
+
+    # # Random indices to keep
+    # flat_diff = grad_diff.reshape(-1)
+    # idx = torch.randperm(N, device=grad_diff.device)[:k_keep]
+
+    # out = torch.zeros_like(grad_diff).reshape(-1)
+    # out.scatter_(0, idx, flat_diff.index_select(0, idx))
+
+    # return out.view_as(grad_diff)
+    # ===== END RANDOM SPARSITY =====
+
+    # ===== ORIGINAL MAGNITUDE-BASED SPARSITY (commented out) =====
     if structured:
         pad = (group_size - grad_diff.shape[-1] % group_size) % group_size
         if pad:
             grad_diff = torch.nn.functional.pad(grad_diff, (0, pad))
-
+    
         G = grad_diff.shape[-1] // group_size
         x = grad_diff.view(*grad_diff.shape[:-1], G, group_size)
         ax = x.abs()
-
+    
         # nth largest == kth smallest of (-abs) with k=n
         kth_neg, _ = (-ax).kthvalue(k=n, dim=-1, keepdim=True)   # (..., G, 1)
         thresh = -kth_neg                                         # (..., G, 1)
-
+    
         # mask in-place without allocating zeros_like
         out = x.clone()
         out.masked_fill_(ax < thresh, 0)
-
+    
         out = out.view(*grad_diff.shape)
         if pad:
             out = out[..., :-pad]
@@ -68,31 +88,49 @@ def generate_reuse_mask(reuse_percentage, grad_output, prev_grad_output, structu
             return torch.zeros_like(grad_diff)
         if k_keep >= N:
             return grad_diff
-
+    
         abs_flat = grad_diff.abs().reshape(-1)
         vals, idx = torch.topk(abs_flat, k_keep, largest=True, sorted=False)
-
+    
         out = torch.zeros_like(grad_diff).reshape(-1)
         out.scatter_(0, idx, grad_diff.reshape(-1).index_select(0, idx))
-
+    
         return out.view_as(grad_diff)
+    # ===== END ORIGINAL =====
+
+def correct_grad_norm(grad_output, prev_grad_output, reuse_grad, reuse_percentage=0.0):
+    """
+    grad_output: the current dense gradient (B,T,D)
+    prev_grad_output: the reused dense gradient (T,D)
+    reuse_grad: the hybrid gradient = (masked diff) + prev_grad_output
+    reuse_percentage: the sparsity level (0.0 = no reuse, 1.0 = full reuse)
+    """
+    dense_norm = grad_output.norm(p=2)
+    reuse_norm = reuse_grad.norm(p=2).clamp(min=1e-8)
+
+    # Handle edge cases where we shouldn't scale:
+    # 1. If grad_output is all zeros (shouldn't happen, but check anyway)
+    # 2. If reuse_percentage >= 0.99 (nearly 100% cached, reference is unreliable)
+    if dense_norm < 1e-10 or reuse_percentage >= 0.99:
+        return reuse_grad
+
+    scale = (dense_norm / reuse_norm).detach()
+    return reuse_grad * scale
 
 
 class ReSpropLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, weight, bias, prev_grad_output, reuse_percentage, structured=False, n=2, group_size=4):
+    def forward(ctx, input, weight, bias, prev_grad_output, reuse_percentage, structured=False, n=2, group_size=4, step=0):
         prev_grad_output = prev_grad_output if prev_grad_output is not None else None
 
         if prev_grad_output is not None and reuse_percentage > 0 and len(input.shape) == 3 and prev_grad_output.size(0) == input.size(1):
             with torch.no_grad():
                 # Precompute prev_grad_input and prev_grad_weight
-                # prev_grad_input = torch.mm(prev_grad_output, weight)                        # pre∇w_l
-                # prev_grad_weight = torch.mm(prev_grad_output.t(), torch.sum(input, dim=0))
                 prev_grad_input = prev_grad_output.matmul(weight).detach()              # [T, I]
                 sum_input = input.sum(dim=0)                                   # [T, I]
                 prev_grad_weight = prev_grad_output.t().matmul(sum_input).detach()  # [I, O]
         else:
-            if prev_grad_output is not None:
+            if prev_grad_output is not None and reuse_percentage > 0:
                 print("Warning: Couldn't reuse gradient due to shape mis-match.")
             prev_grad_output = prev_grad_input = prev_grad_weight = None
 
@@ -104,6 +142,7 @@ class ReSpropLinearFunction(torch.autograd.Function):
         ctx.prev_grad_input = prev_grad_input
         ctx.prev_grad_weight = prev_grad_weight
         ctx.save_for_backward(input, weight, bias)
+        ctx.step = step
 
         B, T, I = input.shape
         out = F.linear(input.view(-1, I), weight, bias)  # [(B*T), O]
@@ -124,18 +163,19 @@ class ReSpropLinearFunction(torch.autograd.Function):
         # Compute gradients
         if ctx.needs_input_grad[0]:
             grad_input = grad_output.matmul(weight)
-            # grad_input = torch.bmm(grad_output, weight.expand(grad_output.size(0), -1, -1))
             if prev_grad_output is not None:
-                grad_input = grad_input.add(prev_grad_input.unsqueeze(0))
-                # grad_input += prev_grad_input
-
+                B = input.size(0)
+                # Expand prev_grad_input from [T, I] to [B, T, I]
+                # grad_input = prev_grad_input.unsqueeze(0).expand(B, -1, -1)
+                grad_input_before = grad_input.add(prev_grad_input.unsqueeze(0))
+                grad_input = correct_grad_norm(grad_output, prev_grad_output, grad_input_before, ctx.reuse_percentage)
 
         if ctx.needs_input_grad[1]:
-            # grad_weight = torch.sum(torch.bmm(grad_output.transpose(1, 2), input), dim=0)
             grad_weight = torch.einsum('bto,bti->oi', grad_output, input)
             if prev_grad_output is not None:
-                grad_weight = grad_weight.add(prev_grad_weight)
-                # grad_weight += prev_grad_weight
+                # grad_weight = prev_grad_weight
+                grad_weight_before = grad_weight.add(prev_grad_weight)
+                grad_weight = correct_grad_norm(grad_output, prev_grad_output, grad_weight_before, ctx.reuse_percentage)
 
         if bias is not None and ctx.needs_input_grad[2]:
             grad_bias = grad_output.sum(dim=(0, 1))
@@ -150,6 +190,8 @@ class ReSpropLinear(nn.Linear):
         self.prev_gradients = {}
         self.step_counter = {}
         self.avg = avg
+        self.force_reanchor_steps = 0
+
 
     def forward(self, input):
         device = input.device
@@ -166,6 +208,29 @@ class ReSpropLinear(nn.Linear):
             n = num1
             group_size = num2
 
+        # Track and print when reuse percentage changes
+        # if not hasattr(self, '_last_reuse_percentage'):
+        #     self._last_reuse_percentage = {}
+        # if device not in self._last_reuse_percentage:
+        #     self._last_reuse_percentage[device] = None
+
+        # if self._last_reuse_percentage[device] != reuse_percentage:
+        #     if structured:
+        #         print(f"[ReSpropLinear] Step {step}: Reuse percentage changed to {num1}:{num2} ({reuse_percentage:.2%})")
+        #     else:
+        #         print(f"[ReSpropLinear] Step {step}: Reuse percentage changed to {reuse_percentage:.2%}")
+        #     self._last_reuse_percentage[device] = reuse_percentage
+
+        #     # detect forced reanchor
+        # if hasattr(self, "force_reanchor_steps") and self.force_reanchor_steps > 0:
+        #     reuse_percentage = 0.0
+        #     self.force_reanchor_steps -= 1
+
+        if step % 250 == 0:
+            reuse_percentage = 0
+            # Clear cached gradients to force reanchoring
+            self.prev_gradients[device] = None
+
         output = ReSpropLinearFunction.apply(
             input, self.weight,
             self.bias if self.bias is not None else None,
@@ -173,7 +238,8 @@ class ReSpropLinear(nn.Linear):
             reuse_percentage, 
             structured,
             n,
-            group_size
+            group_size, 
+            step
         )
 
         if output.requires_grad:
@@ -181,10 +247,15 @@ class ReSpropLinear(nn.Linear):
                 if reuse_percentage > 0: #and self.step_counter[device] % self.k == 0:
                     if self.avg:
                         self.prev_gradients[device] =  grad_output.sum(dim=0) / grad_output.size(0) # torch.mean(grad_output, dim=0) #
-                    else: 
+                    else:
                         self.prev_gradients[device] = grad_output[torch.randint(0, grad_output.size(0), (1,))][0].clone().detach()
+
+                    if self.step_counter[device] % 500 == 0:
+                        print(f"  cached gradient mean: {self.prev_gradients[device].mean():.6f}")
+                        print(f"  cached gradient std: {self.prev_gradients[device].std():.6f}")
+
                 self.step_counter[device] += 1
-                
+
             output.register_hook(hook)
 
         return output
@@ -192,7 +263,27 @@ class ReSpropLinear(nn.Linear):
     def extra_repr(self):
         return super().extra_repr() + f", reuse_percentage={self.reuse_percentage}"
 
-        
+    def clear_reuse_cache(self):
+        """Clears stored previous gradients and enforces reanchoring for a few steps."""
+        for d in getattr(self, "prev_gradients", {}):
+            self.prev_gradients[d] = None
+        if hasattr(self, "prev_grad_output"):
+            for d in self.prev_grad_output:
+                self.prev_grad_output[d] = None
+        if hasattr(self, "prev_attn_prods"):
+            for d in [
+                self.prev_attn_prods,
+                self.prev_V_prods,
+                self.prev_soft_grads,
+                self.prev_K_prods,
+                self.prev_Q_prods,
+            ]:
+                for dev in d:
+                    d[dev] = None
+        self.force_reanchor_steps = 3  # skip reuse for next 3 steps
+
+
+
 class ReSpropAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, prev_grad_output, prev_attn_prod, prev_V_prod, prev_soft_grad, prev_K_prod, prev_Q_prod, reuse_percentage, structured=False, n=2, group_size=4):
@@ -217,24 +308,13 @@ class ReSpropAttentionFunction(torch.autograd.Function):
 
         ctx.save_for_backward(Q, K, V)
 
-        # d_k = Q.size(-1)
-        # attn_scores = torch.bmm(Q, K.transpose(1, 2)) / (d_k ** 0.5)
-        # attn_probs = torch.softmax(attn_scores, dim=-1)
-        # ctx.attn_probs = attn_probs  # current softmax
-
-        # return torch.bmm(attn_probs, V)
-        
         d_k = Q.size(-1)
-        # attn_scores = Q @ K^T / sqrt(d_k)
-        # attn_scores = torch.matmul(Q, K.transpose(1, 2)) * (d_k ** -0.5)
-        attn_scores = torch.einsum('btd, bud -> btu', Q, K) * (d_k ** -0.5)
+        attn_scores = torch.bmm(Q, K.transpose(1, 2)) * (d_k ** -0.5)
         attn_probs = attn_scores.softmax(dim=-1)
-        # Save detached probs (we only need numbers, not gradients through probs)
+
         ctx.attn_probs = attn_probs.detach()
 
-        # out = A @ V
-        return torch.einsum('btu, buv -> btv', attn_probs, V)
-        # return torch.matmul(attn_probs, V)
+        return torch.bmm(attn_probs, V)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -246,55 +326,37 @@ class ReSpropAttentionFunction(torch.autograd.Function):
         d_k = Q.size(-1)
         grad_Q=grad_K=grad_V=None
 
+        B = Q.size(0)
+
         if prev_grad_output is not None and ctx.reuse_percentage > 0:
             grad_diff = generate_reuse_mask(ctx.reuse_percentage, grad_output, prev_grad_output, ctx.structured, ctx.n, ctx.group_size)
-            # grad_attn_probs = torch.bmm(grad_diff, V.transpose(1, 2)) + prev_V_prod
-            # grad_attn_probs = torch.matmul(grad_diff, V.transpose(1, 2)) + prev_V_prod
             grad_attn_probs = torch.einsum('btv, buv -> btu', grad_diff, V) + prev_V_prod
             if ctx.needs_input_grad[2]:
-                # grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_diff) + prev_attn_prod
-                grad_V = torch.einsum('btu,btv->buv', attn_probs, grad_diff) + prev_attn_prod
-                # grad_V = torch.matmul(attn_probs.transpose(1, 2), grad_diff) + prev_attn_prod
-        else: 
-            # grad_attn_probs = torch.bmm(grad_output, V.transpose(1, 2))
-            # grad_attn_probs = torch.matmul(grad_output, V.transpose(1, 2))
+                grad_V_before = torch.einsum('btu,btv->buv', attn_probs, grad_diff) + prev_attn_prod
+                grad_V = correct_grad_norm(grad_output, prev_grad_output, grad_V_before, ctx.reuse_percentage)
+        else:
             grad_attn_probs = torch.einsum('btv, buv -> btu', grad_output, V)
             if ctx.needs_input_grad[2]:
-                # grad_V = torch.bmm(attn_probs.transpose(1, 2), grad_output)
-                # grad_V = torch.matmul(attn_probs.transpose(1, 2), grad_output)
                 grad_V = torch.einsum('btu,btv->buv', attn_probs, grad_output)
 
-        #grad_attn_scores = torch.einsum('btu, btu -> bt', grad_attn_probs, attn_probs)
-        #grad_attn_scores = (grad_attn_probs - attn_probs * grad_attn_scores.unsqueeze(-1)) * attn_probs
-        #grad_attn_scores = grad_attn_scores * (d_k ** -0.5)
-        # Rowwise dot: sum over last dim
         row_dot = (grad_attn_probs * attn_probs).sum(dim=-1, keepdim=True)  # [B, T, 1]
         grad_attn_scores = (grad_attn_probs - row_dot) * attn_probs         # [B, T, T]
         grad_attn_scores = grad_attn_scores * (d_k ** -0.5)
 
-
-        # grad_attn_scores = grad_attn_probs * attn_probs
-        # grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
-        # grad_attn_scores *= (d_k ** -0.5)
-
         if prev_soft_grad is not None and ctx.reuse_percentage > 0:
             grad_attn_diff = generate_reuse_mask(ctx.reuse_percentage, grad_attn_scores, prev_soft_grad, ctx.structured, ctx.n, ctx.group_size)
+            # Use precomputed gradients from cache, expand to batch size
             if ctx.needs_input_grad[0]:
-                # grad_Q = torch.matmul(grad_attn_diff, K) + prev_K_prod
-                # grad_Q = torch.bmm(grad_attn_diff, K) + prev_K_prod
-                grad_Q = torch.einsum('btu, bud -> btd', grad_attn_diff, K) + prev_K_prod
+                grad_Q_before = torch.einsum('btu, bud -> btd', grad_attn_diff, K) + prev_K_prod
+                grad_Q = correct_grad_norm(grad_attn_scores, prev_soft_grad, grad_Q_before, ctx.reuse_percentage)
+
             if ctx.needs_input_grad[1]:
-                # grad_K = torch.bmm(grad_attn_diff.transpose(1, 2), Q) + prev_Q_prod
-                # grad_K = torch.matmul(grad_attn_diff.transpose(1, 2), Q) + prev_Q_prod
-                grad_K = torch.einsum('btu, btd -> bud', grad_attn_diff, Q) + prev_Q_prod
+                grad_K_before = torch.einsum('btu, btd -> bud', grad_attn_diff, Q) + prev_Q_prod
+                grad_K = correct_grad_norm(grad_attn_scores, prev_soft_grad, grad_K_before, ctx.reuse_percentage)
         else:
             if ctx.needs_input_grad[0]:
-                # grad_Q = torch.bmm(grad_attn_scores, K)
-                # grad_Q = torch.matmul(grad_attn_scores, K)
                 grad_Q = torch.einsum('btu, bud -> btd', grad_attn_scores, K)
             if ctx.needs_input_grad[1]:
-                # grad_K = torch.bmm(grad_attn_scores.transpose(1, 2), Q)
-                # grad_K = torch.matmul(grad_attn_scores.transpose(1, 2), Q)
                 grad_K = torch.einsum('btu, btd -> bud', grad_attn_scores, Q)
 
         return grad_Q, grad_K, grad_V, None, None, None, None, None, None, None, None, None, None
@@ -322,6 +384,7 @@ class ReSpropAttention(nn.Module):
         self.embed_dim = embed_dim
         self.reuse_schedule = reuse_schedule or [(0.9, 0)]
         self.k = att_k
+        self.force_reanchor_steps = 0
 
         if lin_reuse_schedule:
             self.q_proj = resprop_linear(att.query, reuse_schedule=lin_reuse_schedule, k=lin_k)
@@ -358,7 +421,17 @@ class ReSpropAttention(nn.Module):
             reuse_percentage = num1/num2
             n = num1
             group_size = num2
-        
+
+        if self.step_counter[device] % 250 == 0:
+            reuse_percentage = 0
+            # Clear cached gradients to force reanchoring
+            self.prev_grad_output[device] = None
+            self.prev_attn_prods[device] = None
+            self.prev_V_prods[device] = None
+            self.prev_soft_grads[device] = None
+            self.prev_K_prods[device] = None
+            self.prev_Q_prods[device] = None
+
         Q = self.q_proj(hidden_states)
         K = self.k_proj(hidden_states)
         V = self.v_proj(hidden_states)
@@ -380,35 +453,9 @@ class ReSpropAttention(nn.Module):
             def hook(grad_output):
                 if reuse_percentage>0 and self.step_counter[device] % self.k == 0:
                     with torch.no_grad():
-                        # sampled_grad = grad_output.sum(dim=0, keepdim=True)/grad_output.size(0) #grad_output.mean(dim=0, keepdim=True).detach()  # [1, T, d] 
-
-                        # Q_ = Q.sum(dim=0, keepdim=True)/Q.size(0) #Q.mean(dim=0, keepdim=True)  # [1, T, d_k]
-                        # K_ = K.sum(dim=0, keepdim=True)/K.size(0) #K.mean(dim=0, keepdim=True)  # [1, T, d_k]
-                        # V_ = V.sum(dim=0, keepdim=True)/V.size(0) #V.mean(dim=0, keepdim=True)  # [1, T, d_v]
-                        # d_k = Q.size(-1)
-
-                        # attn_scores = torch.bmm(Q_, K_.transpose(1, 2)) / (d_k ** 0.5)  # [1, T, T]
-                        # attn_probs = torch.softmax(attn_scores, dim=-1)                 # [1, T, T]
-
-                        # attn_prod = torch.bmm(attn_probs.transpose(1, 2), sampled_grad)  # [1, T, d]
-                        # V_prod = torch.bmm(sampled_grad, V_.transpose(1, 2))             # [1, d, T]
-
-                        # grad_softmax = torch.bmm(sampled_grad, V_.transpose(1, 2))       # [1, T, T]
-                        # grad_attn_scores = grad_softmax * attn_probs                     # [1, T, T]
-                        # grad_attn_scores -= attn_probs * grad_attn_scores.sum(dim=-1, keepdim=True)
-                        # grad_attn_scores /= (d_k ** 0.5)
-
-                        # K_prod = torch.bmm(grad_attn_scores, K_)                         # [1, T, d]
-                        # Q_prod = torch.bmm(grad_attn_scores.transpose(1, 2), Q_)         # [1, T, d]
-
-                        # self.prev_grad_output[device] = sampled_grad
-                        # self.prev_attn_prods[device] = attn_prod.detach()
-                        # self.prev_V_prods[device] = V_prod.detach()
-                        # self.prev_soft_grads[device] = grad_attn_scores.detach()
-                        # self.prev_K_prods[device] = K_prod.detach()
-                        # self.prev_Q_prods[device] = Q_prod.detach()
-
                         sampled_grad = grad_output.mean(dim=0, keepdim=True).detach()   # [1, T, d]
+
+
                         Q_ = Q.mean(dim=0, keepdim=True)                                 # [1, T, d_k]
                         K_ = K.mean(dim=0, keepdim=True)                                 # [1, T, d_k]
                         V_ = V.mean(dim=0, keepdim=True)                                 # [1, T, d_v]
@@ -416,7 +463,6 @@ class ReSpropAttention(nn.Module):
                         d_k = Q.size(-1)
                         inv_sqrt_dk = 1.0 / math.sqrt(d_k)
 
-                        # Attn probs: A = softmax((Q K^T) / sqrt(d_k)) → [1, T, T]
                         attn_scores = torch.einsum('btd,bud->btu', Q_, K_) * inv_sqrt_dk
                         attn_probs  = attn_scores.softmax(dim=-1)                         # [1, T, T]
 
@@ -426,9 +472,6 @@ class ReSpropAttention(nn.Module):
                         # G = dL/dA = sampled_grad @ V^T → [1, T, T]
                         V_prod = torch.einsum('btd,bdu->btu', sampled_grad, V_.transpose(1, 2))
 
-                        # # softmax backward to scores: grad_scores = (G - A * sum(G*A)) * A / sqrt(d_k)
-                        # s = torch.einsum('btu,btu->bt', V_prod, attn_probs).unsqueeze(-1)    # [1, T, 1]
-                        # grad_attn_scores = (V_prod - attn_probs * s) * attn_probs * inv_sqrt_dk  # [1, T, T]
 
                         grad_attn_probs = torch.einsum('btv, buv -> btu', sampled_grad, V_)
                         row_dot = (grad_attn_probs * attn_probs).sum(dim=-1, keepdim=True)  
@@ -457,6 +500,24 @@ class ReSpropAttention(nn.Module):
 
     def extra_repr(self):
         return f"embed_dim={self.embed_dim}, reuse_percentage={self.reuse_percentage}"
+    def clear_reuse_cache(self):
+        """Clears stored previous gradients and enforces reanchoring for a few steps."""
+        for d in getattr(self, "prev_gradients", {}):
+            self.prev_gradients[d] = None
+        if hasattr(self, "prev_grad_output"):
+            for d in self.prev_grad_output:
+                self.prev_grad_output[d] = None
+        if hasattr(self, "prev_attn_prods"):
+            for d in [
+                self.prev_attn_prods,
+                self.prev_V_prods,
+                self.prev_soft_grads,
+                self.prev_K_prods,
+                self.prev_Q_prods,
+            ]:
+                for dev in d:
+                    d[dev] = None
+        self.force_reanchor_steps = 3  # skip reuse for next 3 steps
 
 def _normalize_omitted(layers, omitted_layers):
     """
@@ -584,7 +645,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# Might have to write a custom optimizer with mask
-# Verify if this is problem with using SGD
